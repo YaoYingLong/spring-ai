@@ -16,17 +16,16 @@
 
 package org.springframework.ai.transformer.splitter;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.ai.document.ContentFormatter;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.document.DocumentTransformer;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.springframework.ai.document.ContentFormatter;
-import org.springframework.ai.document.Document;
-import org.springframework.ai.document.DocumentTransformer;
 
 public abstract class TextSplitter implements DocumentTransformer {
 
@@ -82,6 +81,7 @@ public abstract class TextSplitter implements DocumentTransformer {
 		for (int i = 0; i < texts.size(); i++) {
 			String text = texts.get(i);
 			Map<String, Object> metadata = metadataList.get(i);
+			// 转换成分块
 			List<String> chunks = splitText(text);
 			if (chunks.size() > 1) {
 				logger.info("Splitting up document into " + chunks.size() + " chunks.");

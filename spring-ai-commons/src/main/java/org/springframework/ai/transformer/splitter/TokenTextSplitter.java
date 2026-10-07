@@ -16,16 +16,15 @@
 
 package org.springframework.ai.transformer.splitter;
 
-import java.util.ArrayList;
-import java.util.List;
-
 import com.knuddels.jtokkit.Encodings;
 import com.knuddels.jtokkit.api.Encoding;
 import com.knuddels.jtokkit.api.EncodingRegistry;
 import com.knuddels.jtokkit.api.EncodingType;
 import com.knuddels.jtokkit.api.IntArrayList;
-
 import org.springframework.util.Assert;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * A {@link TextSplitter} that splits text into chunks of a target size in tokens.
@@ -50,18 +49,19 @@ public class TokenTextSplitter extends TextSplitter {
 
 	private final Encoding encoding = this.registry.getEncoding(EncodingType.CL100K_BASE);
 
-	// The target size of each text chunk in tokens
+	// The target size of each text chunk in tokens 每轮取出的候选 token 数量
 	private final int chunkSize;
 
-	// The minimum size of each text chunk in characters
+	// The minimum size of each text chunk in characters 允许按标点截断的位置阈值，不保证每块至少350字符
 	private final int minChunkSizeChars;
 
-	// Discard chunks shorter than this
+	// Discard chunks shorter than this。小于该值的块大小会被过丢掉默认值为5
 	private final int minChunkLengthToEmbed;
 
-	// The maximum number of chunks to generate from a text
+	// The maximum number of chunks to generate from a text。分块循环次数上限；剩余内容会合成最后一块
 	private final int maxNumChunks;
 
+	//	保留块内换行；为 false 时将平台换行符替换为空格
 	private final boolean keepSeparator;
 
 	public TokenTextSplitter() {

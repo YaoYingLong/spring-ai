@@ -33,6 +33,12 @@ public class OpenAiChatProperties extends OpenAiParentProperties {
 
 	private String completionsPath = DEFAULT_COMPLETIONS_PATH;
 
+	/**
+	 * 核心的配置是在options中，可以配置
+	 * - spring.ai.openai.chat.options.model
+	 * - spring.ai.openai.chat.options.temperature
+	 * - spring.ai.openai.chat.options.maxTokens
+	 */
 	@NestedConfigurationProperty
 	private final OpenAiChatOptions options = OpenAiChatOptions.builder()
 		.model(DEFAULT_CHAT_MODEL)

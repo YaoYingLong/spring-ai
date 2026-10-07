@@ -53,6 +53,7 @@ import static org.springframework.ai.model.openai.autoconfigure.OpenAIAutoConfig
 @AutoConfiguration(after = { RestClientAutoConfiguration.class, WebClientAutoConfiguration.class,
 		SpringAiRetryAutoConfiguration.class })
 @ConditionalOnClass(OpenAiApi.class)
+// 如果没有配置spring.ai.model.embedding条件成立, 配置为openai条件成立, 配置为ollama条件不成立
 @ConditionalOnProperty(name = SpringAIModelProperties.EMBEDDING_MODEL, havingValue = SpringAIModels.OPENAI,
 		matchIfMissing = true)
 @EnableConfigurationProperties({ OpenAiConnectionProperties.class, OpenAiEmbeddingProperties.class })

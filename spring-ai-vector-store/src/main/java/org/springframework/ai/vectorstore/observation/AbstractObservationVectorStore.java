@@ -46,6 +46,7 @@ public abstract class AbstractObservationVectorStore implements VectorStore {
 	@Nullable
 	private final VectorStoreObservationConvention customObservationConvention;
 
+	//	需要配置具体的embedding模型，最终需要调用模型将文本、图片、视频转换成向量
 	protected final EmbeddingModel embeddingModel;
 
 	protected final BatchingStrategy batchingStrategy;

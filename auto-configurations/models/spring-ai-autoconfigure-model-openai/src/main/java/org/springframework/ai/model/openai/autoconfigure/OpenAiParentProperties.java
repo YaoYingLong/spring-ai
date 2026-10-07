@@ -21,6 +21,13 @@ package org.springframework.ai.model.openai.autoconfigure;
  *
  * @author Christian Tzolov
  * @since 0.8.0
+ *
+ * 这是一个公共的基础类，被各种带有@ConfigurationProperties注解的具体类继承，添加不同的前缀用于解析不同前缀的apiKey、baseUrl等字段
+ * 例如：OpenAiConnectionProperties会自动解析
+ * - spring.ai.openai.apiKey
+ * - spring.ai.openai.baseUrl
+ * - spring.ai.openai.projectId
+ * - spring.ai.openai.organizationId
  */
 class OpenAiParentProperties {
 

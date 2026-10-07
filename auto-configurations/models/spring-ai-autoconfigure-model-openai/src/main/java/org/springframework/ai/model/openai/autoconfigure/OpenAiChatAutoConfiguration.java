@@ -54,10 +54,21 @@ import static org.springframework.ai.model.openai.autoconfigure.OpenAIAutoConfig
  * @author Thomas Vitale
  * @author Ilayaperumal Gopinathan
  */
+
+/**
+ * 当RestClientAutoConfiguration、WebClientAutoConfiguration这些配置参与自动配置时，先处理它们，再处理当前的OpenAiChatAutoConfiguration
+ * RestClientAutoConfiguration ──────┐
+ * WebClientAutoConfiguration ───────┤
+ * SpringAiRetryAutoConfiguration ───┼─→ OpenAiChatAutoConfiguration
+ * ToolCallingAutoConfiguration ─────┘
+ */
 @AutoConfiguration(after = { RestClientAutoConfiguration.class, WebClientAutoConfiguration.class,
 		SpringAiRetryAutoConfiguration.class, ToolCallingAutoConfiguration.class })
+// 如果存在OpenAiApi类
 @ConditionalOnClass(OpenAiApi.class)
+// 注册OpenAiConnectionProperties和OpenAiChatProperties配置Bean并绑定属性
 @EnableConfigurationProperties({ OpenAiConnectionProperties.class, OpenAiChatProperties.class })
+// 控制自动配置是否生效，检查spring.ai.model.chat配置项，配置值需要匹配 "openai"，没有配置这个属性时，也满足条件
 @ConditionalOnProperty(name = SpringAIModelProperties.CHAT_MODEL, havingValue = SpringAIModels.OPENAI,
 		matchIfMissing = true)
 @ImportAutoConfiguration(classes = { SpringAiRetryAutoConfiguration.class, RestClientAutoConfiguration.class,
@@ -70,6 +81,7 @@ public class OpenAiChatAutoConfiguration {
 			ObjectProvider<RestClient.Builder> restClientBuilderProvider,
 			ObjectProvider<WebClient.Builder> webClientBuilderProvider, ResponseErrorHandler responseErrorHandler) {
 
+		// 如果spring.ai.openai.chat.base-url开头的配置存在优先使用，否则使用spring.ai.openai.base-url的配置
 		OpenAIAutoConfigurationUtil.ResolvedConnectionProperties resolved = resolveConnectionProperties(
 				commonProperties, chatProperties, "chat");
 

@@ -84,6 +84,8 @@ import org.springframework.core.io.Resource;
  * @author Ilayaperumal Gopinathan
  * @author Thomas Vitale
  * @author Jemin Huh
+ *
+ * SimpleVectorStore是Spring中默认提供的一个基于内存的向量存储
  */
 public class SimpleVectorStore extends AbstractObservationVectorStore {
 

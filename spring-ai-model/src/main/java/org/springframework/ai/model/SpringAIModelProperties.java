@@ -24,8 +24,10 @@ public final class SpringAIModelProperties {
 
 	public static final String MODEL_PREFIX = "spring.ai.model";
 
+	//	chat模型和embedding模型是单独分开定义的
 	public static final String CHAT_MODEL = MODEL_PREFIX + ".chat";
 
+	//	chat模型和embedding模型是单独分开定义的
 	public static final String EMBEDDING_MODEL = MODEL_PREFIX + ".embedding";
 
 	public static final String TEXT_EMBEDDING_MODEL = MODEL_PREFIX + ".embedding.text";

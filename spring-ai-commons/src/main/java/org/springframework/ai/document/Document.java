@@ -83,17 +83,17 @@ public class Document {
 	public static final ContentFormatter DEFAULT_CONTENT_FORMATTER = DefaultContentFormatter.defaultConfig();
 
 	/**
-	 * Unique ID
+	 * Unique ID: 对于每一个文档需要有一个唯一的Id
 	 */
 	private final String id;
 
 	/**
-	 * Document string content.
+	 * Document string content. 如果文档是文本内容
 	 */
 	private final String text;
 
 	/**
-	 * Document media content
+	 * Document media content 	如果是视频、图片等
 	 */
 	private final Media media;
 

@@ -34,7 +34,7 @@ public class SpringAiRetryProperties {
 	public static final String CONFIG_PREFIX = "spring.ai.retry";
 
 	/**
-	 * Maximum number of retry attempts.
+	 * Maximum number of retry attempts.默认最大重试10次
 	 */
 	private int maxAttempts = 10;
 

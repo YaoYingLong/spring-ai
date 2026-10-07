@@ -26,12 +26,13 @@ public class OpenAiEmbeddingProperties extends OpenAiParentProperties {
 
 	public static final String CONFIG_PREFIX = "spring.ai.openai.embedding";
 
+	// 默认的embeddings模型
 	public static final String DEFAULT_EMBEDDING_MODEL = "text-embedding-ada-002";
-
+	// 默认的embeddings接口的路径
 	public static final String DEFAULT_EMBEDDINGS_PATH = "/v1/embeddings";
 
 	private MetadataMode metadataMode = MetadataMode.EMBED;
-
+	// embeddings接口的路径
 	private String embeddingsPath = DEFAULT_EMBEDDINGS_PATH;
 
 	@NestedConfigurationProperty

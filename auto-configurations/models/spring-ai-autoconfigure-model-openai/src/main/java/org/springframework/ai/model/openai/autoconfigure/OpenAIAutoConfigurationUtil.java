@@ -34,13 +34,16 @@ public final class OpenAIAutoConfigurationUtil {
 
 	public static @NonNull ResolvedConnectionProperties resolveConnectionProperties(
 			OpenAiParentProperties commonProperties, OpenAiParentProperties modelProperties, String modelType) {
-
+		// 如果spring.ai.openai.chat.base-url开头的配置存在优先使用，否则使用spring.ai.openai.base-url的配置
 		String baseUrl = StringUtils.hasText(modelProperties.getBaseUrl()) ? modelProperties.getBaseUrl()
 				: commonProperties.getBaseUrl();
+		// 如果spring.ai.openai.chat.api-key开头的配置存在优先使用，否则使用spring.ai.openai.api-key的配置
 		String apiKey = StringUtils.hasText(modelProperties.getApiKey()) ? modelProperties.getApiKey()
 				: commonProperties.getApiKey();
+		// 如果spring.ai.openai.chat.projectId开头的配置存在优先使用，否则使用spring.ai.openai.projectId的配置
 		String projectId = StringUtils.hasText(modelProperties.getProjectId()) ? modelProperties.getProjectId()
 				: commonProperties.getProjectId();
+		// 如果spring.ai.openai.chat.organizationId开头的配置存在优先使用，否则使用spring.ai.openai.organizationId的配置
 		String organizationId = StringUtils.hasText(modelProperties.getOrganizationId())
 				? modelProperties.getOrganizationId() : commonProperties.getOrganizationId();
 
