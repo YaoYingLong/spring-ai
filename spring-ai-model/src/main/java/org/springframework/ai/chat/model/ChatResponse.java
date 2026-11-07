@@ -30,6 +30,15 @@ import org.springframework.util.CollectionUtils;
 
 /**
  * The chat completion (e.g. generation) response returned by an AI provider.
+ * <p>
+ * 中文导读：模型层的统一响应容器。generations 保存候选输出，每个 Generation 包含
+ * AssistantMessage 及结束原因等生成元数据；chatResponseMetadata 保存请求 ID、模型名、
+ * token 用量等响应级信息。它不包含 ChatClient 的 Advisor context。
+ * <p>
+ * getResult() 只是取第一个候选，而不是合并所有结果。流式情况下每次返回的本类对象
+ * 可能仅包含增量文本、部分内容或用量信息，需要结合具体适配器及 MessageAggregator 阅读。
+ * 工具调用也是合法输出：AssistantMessage 可携带工具名称、调用 ID 和 JSON 参数，
+ * 此时没有普通回答文本并不代表请求失败。
  *
  * @author Christian Tzolov
  * @author Mark Pollack
@@ -109,6 +118,7 @@ public class ChatResponse implements ModelResponse<Generation> {
 	 * Whether the model has requested the execution of a tool.
 	 */
 	public boolean hasToolCalls() {
+		// 检查模型是否提出工具调用意图，不表示工具已经执行成功；执行结果在后续 ToolResponseMessage 中。
 		if (CollectionUtils.isEmpty(this.generations)) {
 			return false;
 		}

@@ -59,6 +59,14 @@ import org.springframework.util.StringUtils;
  * Parts without an index follow the legacy behavior: text is concatenated into one part,
  * tool calls are appended, reasoning and unknown parts are carried in arrival order,
  * media on chunks is not carried.
+ * <p>
+ * 中文导读：在保持原始流逐片向下传递的同时，累积一份完整响应用于完成回调。
+ * doOnNext 只更新累积状态，doOnComplete 才调用 onAggregationComplete；
+ * 异常或取消不会被当成正常完成。该操作符本身不创建调度线程，也不单独订阅上游。
+ * <p>
+ * 当前内容模型存在两条兼容路径：带 StreamingParts 索引的内容按响应 ID 和块索引
+ * 聚合，可保留文本、推理和工具参数的结构；没有索引的旧路径按文本拼接、工具调用追加等
+ * 规则处理。不要把所有片段简单相加，更不能把多轮工具调用中重复的块索引当成同一块。
  *
  * @author Christian Tzolov
  * @author Alexandros Pappas
@@ -133,6 +141,7 @@ public class MessageAggregator {
 				String responseId = (chatResponse.getMetadata() != null && chatResponse.getMetadata().getId() != null)
 						? chatResponse.getMetadata().getId() : "";
 				for (MessagePart part : outputMessage.getParts()) {
+					// 同一响应中的内容块可能交错到达，块索引比到达顺序更能表达最终内容结构。
 					Integer index = StreamingParts.partIndex(part);
 					if (index != null) {
 						groupFor(indexedGroupsRef.get(), responseId, index, part).accept(index, part);
@@ -155,6 +164,8 @@ public class MessageAggregator {
 			}
 			if (chatResponse.getMetadata() != null) {
 				if (chatResponse.getMetadata().getUsage() != null) {
+					// 流中的用量通常是响应级快照；保留最近的正数值，不把每个 chunk 的用量再次求和。
+					// 多轮工具调用的总用量由上层 UsageAccumulator 负责，属于另一个聚合维度。
 					Usage usage = chatResponse.getMetadata().getUsage();
 					metadataUsagePromptTokensRef.set(
 							usage.getPromptTokens() > 0 ? usage.getPromptTokens() : metadataUsagePromptTokensRef.get());
@@ -187,6 +198,7 @@ public class MessageAggregator {
 			}
 		}).doOnComplete(() -> {
 
+			// 只有正常结束才生成完整回答。调用方继续收到的仍是原始片段，完整结果通过回调交付。
 			var usage = new DefaultUsage(metadataUsagePromptTokensRef.get(), metadataUsageGenerationTokensRef.get(),
 					metadataUsageTotalTokensRef.get());
 
@@ -261,6 +273,7 @@ public class MessageAggregator {
 	 * cannot continue, both of which mark the start of a new response in the stream.
 	 */
 	private static IndexedGroup groupFor(List<IndexedGroup> groups, String responseId, int index, MessagePart part) {
+		// 有响应 ID 时按 ID 隔离不同轮次；缺少 ID 时才根据索引回退或内容不能续接推断新响应。
 		if (StringUtils.hasText(responseId)) {
 			for (IndexedGroup group : groups) {
 				if (responseId.equals(group.id)) {
@@ -380,6 +393,7 @@ public class MessageAggregator {
 		}
 
 		void accept(MessagePart incoming) {
+			// partial 表示增量，可追加到已有缓冲；完整块应替换槽位，避免把全文再拼一遍。
 			boolean partial = StreamingParts.isPartial(incoming);
 			if (this.part == null || !partial || this.part.getClass() != incoming.getClass()) {
 				reset(incoming, !partial);

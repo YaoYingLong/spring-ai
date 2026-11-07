@@ -37,6 +37,18 @@ import org.springframework.util.Assert;
 /**
  * The Prompt class represents a prompt used in AI model requests. A prompt consists of
  * one or more messages and additional chat options.
+ * <p>
+ * 中文导读：Prompt 是模型调用的完整输入，不只是一个提示词字符串。
+ * messages 保留 system/user/assistant/tool 的角色和顺序；chatOptions 保存模型名、
+ * 生成参数以及具体选项类型所支持的工具、结构化输出配置。
+ * new Prompt(String) 只是创建单条 UserMessage 的便捷写法。
+ * <p>
+ * 记忆 Advisor 通过增加历史消息实现多轮对话，RAG Advisor 通过改写用户消息增加检索上下文，
+ * 工具循环通过追加 AssistantMessage 和 ToolResponseMessage 让模型看到工具执行结果。
+ * 这些能力最终都汇合为本类，再由 ChatModel 转成供应商协议。
+ * <p>
+ * 本类没有自动防御性复制所有输入：构造器保留传入 List，copy()/mutate() 复制消息时
+ * 仍复用 chatOptions。应按具体复制边界理解对象共享，不能仅凭 final 字段判断深度不可变。
  *
  * @author Mark Pollack
  * @author luocongqiu
@@ -82,6 +94,7 @@ public class Prompt implements ModelRequest<List<Message>> {
 	}
 
 	public String getContents() {
+		// 便捷文本视图会丢失角色、工具和多模态结构；模型适配器应读取 getInstructions()。
 		StringBuilder sb = new StringBuilder();
 		for (Message message : getInstructions()) {
 			sb.append(message.getText());
@@ -118,6 +131,7 @@ public class Prompt implements ModelRequest<List<Message>> {
 	 * UserMessage is returned.
 	 */
 	public UserMessage getUserMessage() {
+		// 从后向前找当前问题。RAG 等组件通常只增强这一条，避免把每一条历史问题都当成本轮输入。
 		for (int i = this.messages.size() - 1; i >= 0; i--) {
 			Message message = this.messages.get(i);
 			if (message instanceof UserMessage userMessage) {
@@ -132,6 +146,7 @@ public class Prompt implements ModelRequest<List<Message>> {
 	 * response message is found, an empty UserMessage is returned.
 	 */
 	public Message getLastUserOrToolResponseMessage() {
+		// 工具循环下一轮的最新输入可能是工具结果，不能只取最后一条 UserMessage。
 		for (int i = this.messages.size() - 1; i >= 0; i--) {
 			Message message = this.messages.get(i);
 			if (message instanceof UserMessage || message instanceof ToolResponseMessage) {
@@ -191,6 +206,7 @@ public class Prompt implements ModelRequest<List<Message>> {
 	}
 
 	public Prompt copy() {
+		// 支持的标准消息按各自 copy 规则复制；选项引用继续共享，不是整个请求对象图的深拷贝。
 		return new Prompt(instructionsCopy(), this.chatOptions);
 	}
 
@@ -226,6 +242,7 @@ public class Prompt implements ModelRequest<List<Message>> {
 	 * @return a new {@link Prompt} instance with the augmented system message.
 	 */
 	public Prompt augmentSystemMessage(Function<SystemMessage, SystemMessage> systemMessageAugmenter) {
+		// 创建新 List，仅替换第一条 system；未匹配时在开头加入，不原地改写当前消息列表。
 		var messagesCopy = new ArrayList<>(this.messages);
 		boolean found = false;
 		for (int i = 0; i < messagesCopy.size(); i++) {
@@ -259,6 +276,8 @@ public class Prompt implements ModelRequest<List<Message>> {
 	 * @return a new {@link Prompt} instance with the augmented user message.
 	 */
 	public Prompt augmentUserMessage(Function<UserMessage, UserMessage> userMessageAugmenter) {
+		// 倒序替换最后一条 user，保留其他历史消息和原选项；lambda 的参数是匹配到的原消息。
+		// 注意当前实现的补建分支在循环内：空消息列表不会执行该分支。
 		var messagesCopy = new ArrayList<>(this.messages);
 		for (int i = messagesCopy.size() - 1; i >= 0; i--) {
 			Message message = messagesCopy.get(i);

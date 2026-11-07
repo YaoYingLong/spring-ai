@@ -27,6 +27,13 @@ import org.springframework.util.Assert;
 /**
  * Represents a request processed by a {@link ChatClient} that ultimately is used to build
  * a {@link Prompt} to be sent to an AI model.
+ * <p>
+ * 中文导读：Advisor 链上的请求信封。prompt 保存有序消息及模型选项，context 保存
+ * 链路本地的数据，例如会话 ID、检索文档和输出格式指令；context 不会整体发送给模型。
+ * Advisor 通常通过 mutate() 构建下一版请求，并把它传给链上的下一个节点。
+ * <p>
+ * record 只固定两个字段的引用，不保证字段内部深度不可变。context 的 Map 可以修改，
+ * copy()/mutate() 复制 Map 容器，但其中的业务对象仍共享；Prompt.copy() 也不是任意对象的深拷贝。
  *
  * @param prompt The prompt to be sent to the AI model
  * @param context The contextual data through the execution chain

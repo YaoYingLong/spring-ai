@@ -36,6 +36,17 @@ import org.springframework.core.ParameterizedTypeReference;
  * to a specific object type using JSON schema. This converter works by generating a JSON
  * schema based on a given Java class or parameterized type reference, which is then used
  * to validate and transform the LLM output into the desired type.
+ * <p>
+ * 中文导读：结构化输出的双向适配器。构造时从 Java Type 生成 JSON Schema，
+ * getFormat() 把 Schema 写成提示词约束；模型返回后，convert() 清理文本并反序列化。
+ * 若选择供应商原生结构化输出，ChatClient 使用 getJsonSchema() 将 Schema 传入模型选项。
+ * <p>
+ * {@code ParameterizedTypeReference} 能保留列表元素等泛型信息；只传 List.class 无法表达
+ * 元素的完整类型。反序列化使用相同的 Type，使生成 Schema 与读取结果保持对应。
+ * <p>
+ * 本转换器的 convert() 不执行独立的 JSON Schema 校验，也不发起模型重试。
+ * 需要验证并反馈错误时由 ChatClient 的 StructuredOutputValidationAdvisor 负责。
+ * 默认 JsonMapper 忽略未知属性，解析成功不等于所有业务约束已经通过验证。
  *
  * @param <T> The target type to which the output will be converted.
  * @author Mark Pollack
@@ -188,6 +199,8 @@ public class BeanOutputConverter<T> implements StructuredOutputConverter<T> {
 	@SuppressWarnings("unchecked")
 	@Override
 	public T convert(String text) {
+		// 模型可能带有 Markdown 围栏或思考标签；默认清理链先去除这些包装，再交给 JSON 解析器。
+		// 清理不负责修复任意非法 JSON，无法反序列化时异常会向调用方传播。
 		// Clean the text using the configured text cleaner
 		text = this.textCleaner.clean(text);
 
@@ -212,6 +225,7 @@ public class BeanOutputConverter<T> implements StructuredOutputConverter<T> {
 	 */
 	@Override
 	public String getFormat() {
+		// 这是发送前的提示约束，不能作为模型一定遵守格式的保证；响应仍需在本地解析。
 		String template = """
 				Your response should be in JSON format.
 				Do not include any explanations, only provide a RFC8259 compliant JSON response following this format without deviation.

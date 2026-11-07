@@ -43,6 +43,20 @@ import org.springframework.util.Assert;
  * Query augmentedQuery = augmenter.augment(query, documents);
  * }</pre>
  *
+ * <p>
+ * 中文导读：RAG 检索完成后的提示词组装器，接收问题与最终文档列表，输出增强后的 Query。
+ * 它既不检索文档，也不调用聊天模型；RetrievalAugmentationAdvisor 只把返回 Query 的 text 写回用户消息。
+ * 可沿 augment 的文档非空分支和 augmentQueryWhenEmptyContext 的空结果分支阅读。
+ *
+ * <p>
+ * 默认只把文档正文按换行连接，metadata、id 和 score 不会自动出现在模型上下文中。
+ * 如需给模型页码、来源或引用标签，应通过 documentFormatter 明确组织这些信息。
+ * 这里没有 token 预算控制或内容真实性校验，召回过多资料的压缩、重排可放到前置后处理器中。
+ *
+ * <p>
+ * allowEmptyContext 默认 false 表示生成一段要求模型礼貌拒答的提示词，仍会继续调用下游模型。
+ * 这不是 Java 层强制返回拒答结果；模型是否遵循“仅根据资料回答”的要求仍需另行评估。
+ *
  * @author Thomas Vitale
  * @since 1.0.0
  */
@@ -99,6 +113,7 @@ public final class ContextualQueryAugmenter implements QueryAugmenter {
 				: DEFAULT_EMPTY_CONTEXT_PROMPT_TEMPLATE;
 		this.allowEmptyContext = allowEmptyContext != null ? allowEmptyContext : DEFAULT_ALLOW_EMPTY_CONTEXT;
 		this.documentFormatter = documentFormatter != null ? documentFormatter : DEFAULT_DOCUMENT_FORMATTER;
+		// 非空上下文模板必须包含 query 与 context 占位符，确保两个输入都有明确插入位置。
 		PromptAssert.templateHasRequiredPlaceholders(this.promptTemplate, "query", "context");
 	}
 
@@ -110,25 +125,31 @@ public final class ContextualQueryAugmenter implements QueryAugmenter {
 		logger.debug("Augmenting query with contextual data");
 
 		if (documents.isEmpty()) {
+			// 判定依据是文档列表为空，不是拼接后的正文为空；空正文文档仍会走普通增强分支。
 			return augmentQueryWhenEmptyContext(query);
 		}
 
 		// 1. Collect content from documents.
+		// 保留传入列表的顺序，由上游决定哪些文档更靠前；formatter 负责资料如何呈现。
 		String documentContext = this.documentFormatter.apply(documents);
 
 		// 2. Define prompt parameters.
 		Map<String, Object> promptParameters = Map.of("query", query.text(), "context", documentContext);
 
 		// 3. Augment user prompt with document context.
+		// 重新构造的 Query 只有文本，history/context 使用 Query(String) 的空默认值。
+		// advisor 只读取该文本，所以原 Prompt 的历史消息不会因此被移除。
 		return new Query(this.promptTemplate.render(promptParameters));
 	}
 
 	private Query augmentQueryWhenEmptyContext(Query query) {
 		if (this.allowEmptyContext) {
+			// 显式允许无资料时返回原 Query，模型可按原问题继续生成，没有新增检索上下文。
 			logger.debug("Empty context is allowed. Returning the original query.");
 			return query;
 		}
 		logger.debug("Empty context is not allowed. Returning a specific query for empty context.");
+		// 默认替换为“知识库范围之外”的指令，原问题不再插入该模板，也没有抛异常或构造 ChatResponse。
 		return new Query(this.emptyContextPromptTemplate.render());
 	}
 

@@ -58,6 +58,21 @@ import org.springframework.util.Assert;
  * don't support tool calling), this advisor passes the request through to the next
  * advisor without modification.
  *
+ * <p>
+ * 中文导读：这是 ChatClient 的工具循环入口。当前主链由 Advisor 发起一轮模型请求，
+ * 从 ChatResponse 识别工具调用，交给 ToolCallingManager 执行，再携带工具结果发起下一轮。
+ * 模型负责生成工具名称和参数，实际 Java 方法或 MCP 请求由应用中的 ToolCallback 执行。
+ *
+ * <p>
+ * 每轮使用 {@code chain.copy(this)} 重建本 Advisor 之后的链，
+ * 因而下游 Advisor 可以观察每一轮模型请求，位于本 Advisor 之前的外层 Advisor 只包围整个循环。
+ * 默认记忆 Advisor 的 order 更小，位于外层；本类用局部消息历史保留工具的中间请求与结果。
+ *
+ * <p>
+ * 终止条件包括模型不再请求工具、工具批次要求 returnDirect，以及 Manager 以异常报告工具调用超限。
+ * 同步路径用 do/while，流式路径则等当前响应正常结束并聚合完毕后再衔接下一段 Flux。
+ * 每轮模型的 token 用量由 UsageAccumulator 累计，避免最终结果只报告最后一次模型调用的用量。
+ *
  * @author Christian Tzolov
  * @author Jewoo Shin
  * @since 2.0.0
@@ -71,6 +86,8 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 	 * {@link org.springframework.ai.chat.client.advisor.api.Advisor#DEFAULT_CHAT_MEMORY_PRECEDENCE_ORDER}
 	 * (+200) so that memory advisors at their default order are placed outside this
 	 * advisor and do not participate in each tool-call iteration.
+	 * <p>
+	 * order 数值较小的 Advisor 先处理请求、最后处理响应；默认记忆 +200 在工具 +300 的外层。
 	 */
 	public static final int DEFAULT_ORDER = Ordered.HIGHEST_PRECEDENCE + 300;
 
@@ -125,6 +142,7 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 		Assert.notNull(chatClientRequest, "chatClientRequest must not be null");
 
 		ChatOptions options = chatClientRequest.prompt().getOptions();
+		// 选项随 ChatClientRequest 中的 Prompt 传入；不支持工具选项的模型直接走普通 Advisor 链。
 		if (!(options instanceof ToolCallingChatOptions toolCallingChatOptions)) {
 			// No tool calling options - skip the tool calling advisor
 			return callAdvisorChain.nextCall(chatClientRequest);
@@ -141,6 +159,8 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 		// call limit counting.
 		var fullTurnHistory = instructions;
 
+		// instructions 用于向下游转发；fullTurnHistory 用于完整记录本轮工具结果和限额统计。
+		// 两者在关闭内部历史时会分开，不能用裁剪后的转发列表代替 Manager 的完整输入。
 		ChatClientResponse chatClientResponse = null;
 		UsageAccumulator usageAccumulator = new UsageAccumulator();
 
@@ -155,6 +175,7 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 				.build();
 
 			// Next Call
+			// 扩展 hook 可以按轮次动态选择工具；下方会重新读取它处理后的选项用于本轮执行。
 			processedChatClientRequest = this.doBeforeCall(processedChatClientRequest, callAdvisorChain);
 
 			// Re-read the options doBeforeCall() may have mutated (e.g. a subclass
@@ -164,6 +185,8 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 			Assert.notNull(toolCallingChatOptions,
 					"redundant check that should never fail (doBeforeCall must not change the options type away from ToolCallingChatOptions), but here to help NullAway");
 
+			// Advisor 链的游标会随 nextCall 消耗；每轮复制“本节点之后”的链，才能再次到达模型节点。
+			// 复制不包含当前工具 Advisor，避免把每一轮又包装为一个新的完整工具循环。
 			chatClientResponse = callAdvisorChain.copy(this).nextCall(processedChatClientRequest);
 
 			chatClientResponse = this.doAfterCall(chatClientResponse, callAdvisorChain);
@@ -178,10 +201,12 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 
 				ToolExecutionResult toolExecutionResult;
 				try {
+					// 同步路径就在当前调用线程执行工具；这里没有异步派发或工具并行化。
 					toolExecutionResult = this.toolCallingManager
 						.executeToolCalls(new Prompt(fullTurnHistory, toolCallingChatOptions), chatResponse);
 				}
 				catch (ToolCallLimitExceededException ex) {
+					// 限额是本层显式处理的终止信号；其他未被 Manager 转为工具结果的异常继续向上抛出。
 					// Return the breach as a single generation - directly to the
 					// application client instead of looping back to the LLM.
 					chatClientResponse = chatClientResponse.mutate()
@@ -197,6 +222,8 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 
 				if (toolExecutionResult.returnDirect()) {
 
+					// 把本批 tool 结果转换为 AssistantMessage/Generation，保留工具 ID、名称和结束原因。
+					// 直接返回意味着无需再请模型解释结果，并不表示之前的模型请求或工具执行被跳过。
 					// Return tool execution result directly to the application client
 					// instead of returning it to the LLM.
 					chatClientResponse = chatClientResponse.mutate()
@@ -223,6 +250,8 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 			ChatClientResponse chatClientResponse, ToolExecutionResult toolExecutionResult) {
 
 		if (!this.conversationHistoryEnabled) {
+			// 下游记忆 Advisor 负责补全历史时，只传系统指令和最新 tool response，避免重复追加旧消息。
+			// 这一模式需要相应的记忆配置；仅关闭本开关并不会自动建立可续接的完整对话。
 			List<Message> history = toolExecutionResult.conversationHistory();
 			if (history.isEmpty()) {
 				return history;
@@ -267,6 +296,7 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 		}
 
 		return Flux.defer(() -> {
+			// 初始化放在订阅时，确保重复订阅拥有独立的用量累积状态；构建 Flux 本身不会执行模型或工具。
 			ChatClientRequest initializedRequest = this.doInitializeLoopStream(chatClientRequest, streamAdvisorChain);
 			// Subscription-local accumulator so usage is not shared across subscriptions.
 			UsageAccumulator usageAccumulator = new UsageAccumulator();
@@ -327,6 +357,11 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 	/**
 	 * Handles tool call detection and recursion after streaming completes. Returns empty
 	 * flux if no tool call, or recursive stream if tool call detected.
+	 * <p>
+	 * 聚合器在正常完成时填入完整响应，concatWith 随后进入本方法。
+	 * 这样执行工具时可以拿到完整参数，而不是尚未拼完的 JSON 片段；带工具调用的响应块会被外层过滤。
+	 * 未携带工具调用的文本块仍可向外传递，因此本类不是缓存所有中间输出后只发布最终回答。
+	 * 如果本轮流报错或订阅在完成前取消，则不会启动 concatWith 中的下一轮工具处理。
 	 */
 	private Flux<ChatClientResponse> handleToolCallRecursion(ChatClientResponse aggregatedResponse,
 			ChatClientRequest finalRequest, List<Message> fullTurnHistory, StreamAdvisorChain streamAdvisorChain,
@@ -357,9 +392,13 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 		final ChatClientResponse finalAggregatedResponse = aggregatedResponse;
 
 		// Execute tool calls on bounded elastic scheduler (tool execution is blocking)
+		// ToolCallback 是阻塞接口，所以将本段订阅移到 boundedElastic，避免在模型网络事件线程直接执行。
+		// 取消订阅不等于回滚已经执行的工具；正在运行的工具能否停止仍取决于其对中断/取消的支持。
 		Flux<ChatClientResponse> toolCallFlux = Flux.deferContextual(ctx -> {
 			ToolExecutionResult toolExecutionResult;
 			try {
+				// 将本订阅 Reactor Context 暂存到当前线程，Manager 用它关联 observation，
+				// AsyncMcpToolCallback 用它给内部 block() 创建的新订阅恢复上下文。
 				ToolCallReactiveContextHolder.setContext(ctx);
 				toolExecutionResult = this.toolCallingManager.executeToolCalls(new Prompt(fullTurnHistory, optionsCopy),
 						chatResponse);
@@ -379,6 +418,7 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 				return Flux.just(usageAccumulator.applyAccumulatedUsage(limitResponse));
 			}
 			finally {
+				// boundedElastic 线程会复用，必须清理 ThreadLocal，避免下一次工具调用串入前一次上下文。
 				ToolCallReactiveContextHolder.clearContext();
 			}
 
@@ -394,6 +434,7 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 			}
 			else {
 				// Recursive call with updated conversation history
+				// 下一段 Flux 在本批工具完成后才建立；完整历史继续传给 Manager，转发历史可由 hook 裁剪。
 				List<Message> nextInstructions = this.doGetNextInstructionsForToolCallStream(finalRequest,
 						finalAggregatedResponse, toolExecutionResult);
 				return this.internalStream(streamAdvisorChain, originalRequest, optionsCopy, nextInstructions,
@@ -448,6 +489,7 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 	 */
 	protected Flux<ChatClientResponse> doFinalizeLoopStream(Flux<ChatClientResponse> chatClientResponseFlux,
 			StreamAdvisorChain streamAdvisorChain) {
+		// 当前调用点位于“本轮没有工具调用”的结束分支，returnDirect 和限额分支会直接返回自己的 Flux。
 		return chatClientResponseFlux;
 	}
 
@@ -462,6 +504,7 @@ public class ToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvis
 	protected List<Message> doGetNextInstructionsForToolCallStream(ChatClientRequest chatClientRequest,
 			ChatClientResponse chatClientResponse, ToolExecutionResult toolExecutionResult) {
 
+		// 与同步路径相同：是否携带完整历史由工具循环与下游记忆 Advisor 的职责分配决定。
 		if (!this.conversationHistoryEnabled) {
 			List<Message> history = toolExecutionResult.conversationHistory();
 			if (history.isEmpty()) {

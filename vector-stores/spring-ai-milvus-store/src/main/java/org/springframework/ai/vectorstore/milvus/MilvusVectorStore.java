@@ -16,14 +16,6 @@
 
 package org.springframework.ai.vectorstore.milvus;
 
-import java.lang.reflect.Type;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
-import java.util.stream.Collectors;
-
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
@@ -41,13 +33,7 @@ import io.milvus.param.MetricType;
 import io.milvus.param.R;
 import io.milvus.param.R.Status;
 import io.milvus.param.RpcStatus;
-import io.milvus.param.collection.CollectionSchemaParam;
-import io.milvus.param.collection.CreateCollectionParam;
-import io.milvus.param.collection.DropCollectionParam;
-import io.milvus.param.collection.FieldType;
-import io.milvus.param.collection.HasCollectionParam;
-import io.milvus.param.collection.LoadCollectionParam;
-import io.milvus.param.collection.ReleaseCollectionParam;
+import io.milvus.param.collection.*;
 import io.milvus.param.dml.DeleteParam;
 import io.milvus.param.dml.InsertParam;
 import io.milvus.param.dml.SearchParam;
@@ -59,7 +45,6 @@ import io.milvus.response.SearchResultsWrapper;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.jspecify.annotations.Nullable;
-
 import org.springframework.ai.document.Document;
 import org.springframework.ai.document.DocumentMetadata;
 import org.springframework.ai.embedding.EmbeddingModel;
@@ -77,6 +62,10 @@ import org.springframework.ai.vectorstore.observation.VectorStoreObservationCont
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.util.Assert;
 import org.springframework.util.StringUtils;
+
+import java.lang.reflect.Type;
+import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * Milvus implementation of the {@link org.springframework.ai.vectorstore.VectorStore}
@@ -255,6 +244,7 @@ public class MilvusVectorStore extends AbstractObservationVectorStore implements
 		List<List<Float>> embeddingArray = new ArrayList<>();
 
 		// TODO: Need to customize how we pass the embedding options
+		// 调用embedding模型将文档内容转换为向量，批量转换
 		List<float[]> embeddings = this.embeddingModel.embed(documents, EmbeddingOptions.builder().build(),
 				this.batchingStrategy);
 
@@ -288,6 +278,7 @@ public class MilvusVectorStore extends AbstractObservationVectorStore implements
 		}
 		InsertParam insertParam = insertParamBuilder.build();
 
+		// 插入向量数据库
 		R<MutationResult> status = this.milvusClient.insert(insertParam);
 		if (status.getException() != null) {
 			throw new RuntimeException("Failed to insert:", status.getException());

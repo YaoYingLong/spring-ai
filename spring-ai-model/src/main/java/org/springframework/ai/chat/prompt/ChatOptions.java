@@ -25,6 +25,14 @@ import org.springframework.ai.model.ModelOptions;
 /**
  * {@link ModelOptions} representing the common options that are portable across different
  * chat models.
+ * <p>
+ * 中文导读：这里定义不同供应商共享的生成参数，具体支持范围仍由模型决定。
+ * null 通常表示本层未指定；默认值如何补齐取决于调用入口和具体适配器。
+ * ChatClient 会先复制 ChatModel.getOptions()，再合并请求 Builder 的非 null 配置。
+ * 直接调用 ChatModel 时，应阅读该实现的选项处理，不能假设存在同样的合并过程。
+ * <p>
+ * mutate() 必须保留具体 Builder 类型，才能在通用调用链中继续传递供应商字段、
+ * ToolCallingChatOptions 的工具配置及 StructuredOutputChatOptions 的输出 Schema。
  */
 public interface ChatOptions extends ModelOptions {
 

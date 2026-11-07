@@ -32,6 +32,10 @@ import org.springframework.util.Assert;
 
 /**
  * A {@link StreamAdvisor} that uses a {@link ChatModel} to generate a streaming response.
+ * <p>
+ * 中文导读：流式链的终点，把每个 ChatResponse 片段包装成携带 Advisor context 的响应。
+ * 不在这里等待完整文本；完整响应的汇总由外层聚合器负责，工具参数的协议级组装则由
+ * 具体模型适配器处理。流式与同步链分别构建，不能假定同步终点的所有逻辑也在此运行。
  *
  * @author Thomas Vitale
  * @since 1.0.0
@@ -50,6 +54,8 @@ public final class ChatModelStreamAdvisor implements StreamAdvisor {
 			StreamAdvisorChain streamAdvisorChain) {
 		Assert.notNull(chatClientRequest, "the chatClientRequest cannot be null");
 
+		// publishOn 将其后的信号处理切换到 boundedElastic；它不会把上游所有 SDK 操作都迁到该线程池。
+		// 模型网络请求在哪个线程运行、取消时如何关闭资源，需要继续阅读具体 ChatModel 实现。
 		return this.chatModel.stream(chatClientRequest.prompt())
 			.map(chatResponse -> ChatClientResponse.builder()
 				.chatResponse(chatResponse)

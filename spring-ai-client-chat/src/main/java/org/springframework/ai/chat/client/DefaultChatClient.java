@@ -74,6 +74,18 @@ import org.springframework.util.StringUtils;
 /**
  * The default implementation of {@link ChatClient} as created by the
  * {@link Builder#build()} } method.
+ * <p>
+ * 中文导读：本类把“构建请求”“选择调用方式”“执行并读取响应”分成三个阶段。
+ * 先读 prompt() 与 DefaultChatClientRequestSpec，再读该 Spec 的 call()/stream()，
+ * 最后进入 DefaultCallResponseSpec 或 DefaultStreamResponseSpec。
+ * 实际组装 Prompt 的代码位于 DefaultChatClientUtils，链的推进位于 DefaultAroundAdvisorChain。
+ * <p>
+ * 一次同步请求的主线是 prompt().user(...).call().content()：复制默认配置，
+ * 收集输入，构建 Advisor 链和 Prompt，启动 Observation，调用链，提取模型文本。
+ * entity(...) 还会在调用前传递输出格式/Schema，在调用后执行本地反序列化。
+ * <p>
+ * 一次客户端请求可能因为工具调用或结构化输出重试产生多次模型请求。
+ * 因此客户端、Advisor、模型、工具各层 Observation 的范围不同，排查耗时时要区分层级。
  *
  * @author Mark Pollack
  * @author Christian Tzolov
@@ -104,6 +116,8 @@ public class DefaultChatClient implements ChatClient {
 
 	@Override
 	public ChatClientRequestSpec prompt() {
+		// 为本次请求复制默认配置；集合容器重新建立，但模型、Advisor、回调等协作对象会复用。
+		// RequestSpec 是逐步填写的可变对象，应该在每次业务请求内创建和使用。
 		return new DefaultChatClientRequestSpec(this.defaultChatClientRequest);
 	}
 
@@ -428,6 +442,12 @@ public class DefaultChatClient implements ChatClient {
 
 	}
 
+	/**
+	 * 同步结果入口：持有已构建的请求与执行链，但构造本对象不会调用模型。
+	 * content()/chatResponse()/entity() 等读取操作才向下执行，并不是对缓存结果的不同视图。
+	 * 链会弹出已执行的 Advisor，因此一次请求应选择一个结果读取入口；同时需要原始响应和
+	 * 反序列化对象时，使用 responseEntity(...)。
+	 */
 	public static class DefaultCallResponseSpec implements CallResponseSpec {
 
 		private final ChatClientRequest request;
@@ -571,6 +591,8 @@ public class DefaultChatClient implements ChatClient {
 
 		private BaseAdvisorChain resolveAdvisorChain(Consumer<EntityParamSpec> consumer,
 				StructuredOutputConverter<?> converter) {
+			// 两个独立选项：native 控制 Schema 如何发送，validated 控制是否在本地验证并反馈重试。
+			// 仅选择 entity(Class) 并不等于自动启用 Schema 验证 Advisor。
 			var spec = new DefaultEntityParamSpec();
 			consumer.accept(spec);
 			if (spec.isEnableNative()) {
@@ -592,6 +614,8 @@ public class DefaultChatClient implements ChatClient {
 		private <T> @Nullable T doSingleWithBeanOutputConverter(StructuredOutputConverter<T> outputConverter,
 				BaseAdvisorChain advisorChain) {
 
+			// 转换器同时承担“告诉模型应该输出什么”和“把响应文本转成 Java 对象”两个方向。
+			// 先把格式写入 context，链末尾的 ChatModelCallAdvisor 再落实到 Prompt 或模型选项。
 			if (StringUtils.hasText(outputConverter.getFormat())) {
 				// Used for default structured output format support, based on prompt
 				// instructions.
@@ -613,6 +637,7 @@ public class DefaultChatClient implements ChatClient {
 			if (stringResponse == null) {
 				return null;
 			}
+			// 本地反序列化发生在模型返回后；格式错误会按转换器契约抛出异常，不会自动重发请求。
 			return outputConverter.convert(stringResponse);
 		}
 
@@ -639,6 +664,8 @@ public class DefaultChatClient implements ChatClient {
 		private ChatClientResponse doGetObservableChatClientResponse(ChatClientRequest chatClientRequest,
 				BaseAdvisorChain advisorChain) {
 
+			// 客户端观测包围整个 Advisor 链，因此包含检索、工具循环等开销。
+			// 模型适配器内部还有单次模型请求的观测，两者不是重复统计同一层职责。
 			String outputFormat = (String) chatClientRequest.context()
 				.getOrDefault(ChatClientAttributes.OUTPUT_FORMAT.getKey(), null);
 
@@ -673,6 +700,11 @@ public class DefaultChatClient implements ChatClient {
 
 	}
 
+	/**
+	 * 流式结果入口：构建 Flux 描述后续处理，订阅时才进入 Advisor 链。
+	 * 文本片段会逐个传给调用方，同时在旁路累积完整响应供观测使用。
+	 * 当前响应 Spec 持有会被消费的链，不应把同一个实例当成可反复订阅的请求工厂。
+	 */
 	public static class DefaultStreamResponseSpec implements StreamResponseSpec {
 
 		private final ChatClientRequest request;
@@ -697,6 +729,8 @@ public class DefaultChatClient implements ChatClient {
 		}
 
 		private Flux<ChatClientResponse> doGetObservableFluxChatResponse(ChatClientRequest chatClientRequest) {
+			// 从订阅者的 Reactor Context 获取父 Observation，不能只依赖当前线程的 ThreadLocal。
+			// 流式信号可能经过多个调度器，观测上下文需要沿订阅链传播。
 			return Flux.deferContextual(contextView -> {
 
 				ChatClientObservationContext observationContext = ChatClientObservationContext.builder()
@@ -721,6 +755,7 @@ public class DefaultChatClient implements ChatClient {
 					observation.start();
 				}
 
+				// doFinally 覆盖正常完成、异常和取消，避免只在完成时结束观测造成资源生命周期失配。
 				// @formatter:off
 				// Apply the advisor chain that terminates with the ChatModelStreamAdvisor.
 				Flux<ChatClientResponse> chatClientResponse = this.advisorChain.nextStream(chatClientRequest)
@@ -728,6 +763,7 @@ public class DefaultChatClient implements ChatClient {
 						.doFinally(s -> observation.stop())
 						.contextWrite(ctx -> ctx.put(ObservationThreadLocalAccessor.KEY, observation));
 				// @formatter:on
+				// 聚合器保留原始增量流，只在正常完成时把聚合结果交给观测回调。
 				return CHAT_CLIENT_MESSAGE_AGGREGATOR.aggregateChatClientResponse(chatClientResponse,
 						observationContext::setResponse);
 			});
@@ -758,6 +794,12 @@ public class DefaultChatClient implements ChatClient {
 
 	}
 
+	/**
+	 * 单次请求的配置收集器。user/system 的模板变量用于渲染文本；advisorParams 用于
+	 * Advisor 间传参；toolContext 用于工具执行。这三种 Map 不会自动互相转换。
+	 * setters 主要保存配置，转换成 Prompt、模型选项和请求 context 的步骤统一放在
+	 * DefaultChatClientUtils.toChatClientRequest 中。
+	 */
 	public static class DefaultChatClientRequestSpec implements ChatClientRequestSpec {
 
 		private final ObservationRegistry observationRegistry;
@@ -837,6 +879,8 @@ public class DefaultChatClient implements ChatClient {
 
 			this.chatModel = chatModel;
 			this.toolCallingAdvisorBuilder = toolCallingAdvisorBuilder;
+			// 克隆选项 Builder，并复制下面的 List/Map 容器，隔离不同请求对配置集合的修改。
+			// 这不是整个对象图的深拷贝；例如 Advisor 实例仍可由多个请求共享。
 			this.optionsCustomizer = customizer != null ? customizer.clone() : null;
 
 			this.userText = userText;
@@ -1029,6 +1073,8 @@ public class DefaultChatClient implements ChatClient {
 			Assert.notNull(toolObjects, "toolObjects cannot be null");
 			Assert.noNullElements(toolObjects, "toolObjects cannot contain null elements");
 
+			// 统一工具注册入口：已有回调直接保存，Provider 延迟展开，普通对象转为 @Tool 方法回调。
+			// 注册仅提供模型可选择的工具定义与本地执行入口，这里还没有执行用户的方法。
 			List<Object> pojos = new ArrayList<>();
 			for (Object toolObject : toolObjects) {
 				if (toolObject instanceof ToolCallback toolCallback) {
@@ -1156,6 +1202,8 @@ public class DefaultChatClient implements ChatClient {
 		public ChatClientRequestSpec user(Consumer<PromptUserSpec> consumer) {
 			Assert.notNull(consumer, "consumer cannot be null");
 
+			// user(u -> u.text(...).param(...)) 的 lambda 在这里立即执行，u 就是下面的 us。
+			// lambda 收集的是文本和变量；真正模板替换发生在 toChatClientRequest 中。
 			var us = new DefaultPromptUserSpec();
 			consumer.accept(us);
 			this.userText = StringUtils.hasText(us.text()) ? us.text() : this.userText;
@@ -1174,6 +1222,7 @@ public class DefaultChatClient implements ChatClient {
 
 		@Override
 		public CallResponseSpec call() {
+			// 构建执行链并冻结本轮输入到请求对象；远程调用在响应 Spec 的结果读取方法中发生。
 			BaseAdvisorChain advisorChain = buildAdvisorChain();
 			return new DefaultCallResponseSpec(DefaultChatClientUtils.toChatClientRequest(this), advisorChain,
 					this.observationRegistry, this.chatClientObservationConvention);
@@ -1181,17 +1230,21 @@ public class DefaultChatClient implements ChatClient {
 
 		@Override
 		public StreamResponseSpec stream() {
+			// 同样先构建配置；返回流式响应入口后，Flux 的订阅才驱动链执行。
 			BaseAdvisorChain advisorChain = buildAdvisorChain();
 			return new DefaultStreamResponseSpec(DefaultChatClientUtils.toChatClientRequest(this), advisorChain,
 					this.observationRegistry, this.chatClientObservationConvention);
 		}
 
 		private BaseAdvisorChain buildAdvisorChain() {
+			// 工具循环放在 Advisor 层：先补齐默认工具 Advisor，再确保整条链只有一个工具调度者。
 			autoRegisterToolCallingAdvisor();
 			validateSingleToolAdvisor();
 
 			// At the stack bottom add the model call advisors.
 			// They play the role of the last advisors in the advisor chain.
+			// 同步和流式终点都加入候选集合，DefaultAroundAdvisorChain 会按接口类型拆成两条链。
+			// 实际顺序由 getOrder() 决定，数值越小越早处理请求；响应沿嵌套调用方向返回。
 			List<Advisor> chain = new ArrayList<>(this.advisors);
 			chain.add(ChatModelCallAdvisor.builder().chatModel(this.chatModel).build());
 			chain.add(ChatModelStreamAdvisor.builder().chatModel(this.chatModel).build());
@@ -1216,6 +1269,8 @@ public class DefaultChatClient implements ChatClient {
 		 */
 		private void autoRegisterToolCallingAdvisor() {
 
+			// 即使没有静态注册工具，也保留默认工具 Advisor，以接住其他 Advisor 动态注入的工具。
+			// 调用方可通过 advisorParams 显式关闭，或自行提供一个 ToolAdvisor 接管整个循环。
 			boolean autoRegisterDisabled = Boolean.FALSE
 				.equals(this.advisorParams.get(ChatClientAttributes.TOOL_CALLING_ADVISOR_AUTO_REGISTER.getKey()));
 			if (autoRegisterDisabled) {
@@ -1229,6 +1284,8 @@ public class DefaultChatClient implements ChatClient {
 
 			int configuredOrder = this.toolCallingAdvisorBuilder.getAdvisorOrder();
 
+			// 工具 Advisor 每轮只重新执行自己下游的链。若记忆 Advisor 在下游，它每轮都会补历史，
+			// 此时关闭工具 Advisor 自己的历史累积，避免两个组件重复装入同一段工具对话。
 			boolean hasDownstreamMemoryAdvisor = this.advisors.stream()
 				.anyMatch(a -> a instanceof MemoryAdvisor && a.getOrder() > configuredOrder);
 

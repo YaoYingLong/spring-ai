@@ -76,6 +76,15 @@ import org.springframework.util.Assert;
  * repository in use, since none of them persists
  * {@link org.springframework.ai.chat.messages.part.MessagePart message parts} yet - see
  * the reference documentation for the details.
+ * <p>
+ * 中文导读：这是同一 ChatModel 接口的 Responses API 实现，SDK 入口是
+ * {@code responses().create/createStreaming}，而非 Chat Completions 的 choices/delta 协议。
+ * 请求映射、响应 item 映射和流事件组装分别下沉到 ResponsesRequestBuilder、
+ * ResponsesItemMapper、ResponsesStreamAssembler，本类连接它们并管理一次调用的观测生命周期。
+ * <p>
+ * 请求构建器显式设置 store=false，每轮发送完整 Prompt；本类不依赖服务端保存会话。
+ * 函数工具只发送定义并返回调用请求，Java 工具执行循环仍交给 {@code ToolCallingAdvisor}。
+ * 因此切换 API 不会把 ChatMemory、RAG 或本地工具执行自动迁到 OpenAI 服务端。
  *
  * @author Dimitar Proynov
  * @since 2.1.0
@@ -118,9 +127,11 @@ public final class OpenAiResponsesChatModel implements ChatModel {
 
 	@Override
 	public ChatResponse call(Prompt prompt) {
+		// 1. 先检查通用选项中不受支持的字段，再按 Responses 的原生/通用选项规则准备 Prompt。
 		warnUnsupportedOptions(prompt.getOptions());
 		Prompt requestPrompt = buildRequestPrompt(prompt);
 
+		// 2. 消息转为 Responses input items，系统指令和工具定义也在专用 builder 中完成映射。
 		ResponseCreateParams request = ResponsesRequestBuilder.build(requestPrompt, this.toolCallingManager);
 		RequestOptions requestOptions = buildRequestOptions(requestPrompt);
 
@@ -129,15 +140,18 @@ public final class OpenAiResponsesChatModel implements ChatModel {
 			.provider(AiProvider.OPENAI.value())
 			.build();
 
+		// 3. 同步 SDK 调用与 item 映射共用一次模型 Observation；异常按同步调用契约向外传播。
 		return ChatModelObservationDocumentation.CHAT_MODEL_OPERATION
 			.observation(this.observationConvention, DEFAULT_OBSERVATION_CONVENTION, () -> observationContext,
 					this.observationRegistry)
 			.observe(() -> {
 				Response response = this.openAiClient.responses().create(request, requestOptions);
+				// HTTP 成功不代表模型响应成功：响应体 status=failed 也需转成调用失败。
 				if (isFailed(response)) {
 					throw ResponsesItemMapper.failure(response);
 				}
 
+				// 多种 output item 组成同一个 Generation 的 message parts，保留文本、推理和工具信息。
 				Generation generation = ResponsesItemMapper.toGeneration(response);
 				Usage usage = ResponsesItemMapper.toUsage(response);
 				ChatResponse chatResponse = new ChatResponse(List.of(generation),
@@ -153,6 +167,7 @@ public final class OpenAiResponsesChatModel implements ChatModel {
 		warnUnsupportedOptions(prompt.getOptions());
 		Prompt requestPrompt = buildRequestPrompt(prompt);
 
+		// 每次订阅重新创建请求、流组装器和 Observation，状态不会跨订阅共享。
 		return Flux.deferContextual(contextView -> {
 			ResponseCreateParams request = ResponsesRequestBuilder.build(requestPrompt, this.toolCallingManager);
 			RequestOptions requestOptions = buildRequestOptions(requestPrompt);
@@ -166,6 +181,7 @@ public final class OpenAiResponsesChatModel implements ChatModel {
 					this.observationConvention, DEFAULT_OBSERVATION_CONVENTION, () -> observationContext,
 					this.observationRegistry);
 			Observation parentObservation = contextView.getOrDefault(ObservationThreadLocalAccessor.KEY, null);
+			// 父子关系来自 Reactor Context；短暂打开父 Scope 仅用于正确创建当前模型的 span。
 			observation.parentObservation(parentObservation);
 			// Briefly make the parent observation current while starting this one, so
 			// Micrometer tracing derives the span's parent from the parent observation
@@ -176,9 +192,11 @@ public final class OpenAiResponsesChatModel implements ChatModel {
 				observation.start();
 			}
 
+			// SDK 按事件回调推送，线程由 SDK/HTTP 客户端决定；本层没有额外调度或重试操作符。
 			Flux<ResponseStreamEvent> events = Flux.create(sink -> {
 				AsyncStreamResponse<ResponseStreamEvent> response = this.openAiClientAsync.responses()
 					.createStreaming(request, requestOptions);
+				// 下游取消或流终止时关闭本次 AsyncStreamResponse，释放读取该响应的资源。
 				sink.onDispose(response::close);
 				response.subscribe(sink::next).onCompleteFuture().whenComplete((unused, throwable) -> {
 					if (throwable != null) {
@@ -193,8 +211,10 @@ public final class OpenAiResponsesChatModel implements ChatModel {
 			// One assembler per subscription: it accumulates the transcript and the
 			// running reasoning summary for this stream only.
 			ResponsesStreamAssembler assembler = new ResponsesStreamAssembler();
+			// 一个协议事件可产生零到多个消息增量；按事件顺序组装，工具参数无需复用 ChatCompletions 的 ChunkMerger。
 			Flux<ChatResponse> chatResponses = events.concatMapIterable(assembler::apply);
 
+			// 完成、错误和取消都停止观测；完整回答只供聚合回调记录，仍向调用方透传增量响应。
 			Flux<ChatResponse> observedResponses = chatResponses.doOnError(observation::error)
 				.doFinally(signal -> observation.stop())
 				.contextWrite(ctx -> ctx.put(ObservationThreadLocalAccessor.KEY, observation));
@@ -256,6 +276,8 @@ public final class OpenAiResponsesChatModel implements ChatModel {
 	 * to override one field and keep the rest.
 	 */
 	private Prompt buildRequestPrompt(Prompt prompt) {
+		// 三种情况：无选项用模型默认值；原生选项整体替换；通用 ChatOptions 合并到默认值副本。
+		// 这比 OpenAiChatModel 多了通用选项转换分支，不能把两个适配器的参数规则混为一谈。
 		ChatOptions runtimeOptions = prompt.getOptions();
 		if (runtimeOptions == null) {
 			return prompt.mutate().chatOptions(this.options).build();
@@ -269,6 +291,7 @@ public final class OpenAiResponsesChatModel implements ChatModel {
 	}
 
 	private RequestOptions buildRequestOptions(Prompt prompt) {
+		// 请求级设置只有 timeout；客户端的连接地址、认证和重试在 Builder.build 中确定。
 		OpenAiResponsesChatOptions chatOptions = (OpenAiResponsesChatOptions) prompt.getOptions();
 		Assert.state(chatOptions != null, "Prompt options must be OpenAiResponsesChatOptions type");
 		RequestOptions.Builder requestOptions = RequestOptions.builder();
@@ -358,6 +381,7 @@ public final class OpenAiResponsesChatModel implements ChatModel {
 		}
 
 		public OpenAiResponsesChatModel build() {
+			// 未显式传客户端才调用 OpenAiSetup；兼容性检查仍会拒绝被识别为 GitHub Models 的配置。
 			OpenAiResponsesChatOptions resolvedOptions = Objects.requireNonNullElseGet(this.options,
 					() -> OpenAiResponsesChatOptions.builder().build());
 			ObservationRegistry resolvedObservationRegistry = Objects.requireNonNullElse(this.observationRegistry,

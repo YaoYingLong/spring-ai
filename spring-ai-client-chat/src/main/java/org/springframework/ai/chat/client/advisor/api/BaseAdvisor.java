@@ -35,6 +35,13 @@ import org.springframework.util.Assert;
  * {@link #adviseStream(ChatClientRequest, StreamAdvisorChain)} methods, delegating the
  * actual logic to the {@link #before(ChatClientRequest, AdvisorChain advisorChain)} and
  * {@link #after(ChatClientResponse, AdvisorChain advisorChain)} methods.
+ * <p>
+ * 中文导读：将常见 Advisor 写成 before/after 模板，便于在调用前改写 Prompt，
+ * 在调用后补充响应。同步路径是 before、下游链、after 的顺序，异常会中断正常返回路径。
+ * <p>
+ * 流式默认实现先在 getScheduler() 指定的线程池执行 before，再订阅下游。
+ * after 仅作用于包含结束原因的响应片段，不自动获得整段回答，也不是 doFinally。
+ * 需要完整响应或特殊取消处理的 Advisor 应自行实现流式聚合/生命周期逻辑。
  *
  * @author Thomas Vitale
  * @since 1.0.0
@@ -66,6 +73,7 @@ public interface BaseAdvisor extends CallAdvisor, StreamAdvisor {
 			.flatMapMany(streamAdvisorChain::nextStream);
 
 		return chatClientResponseFlux.map(response -> {
+			// 这里判断响应的 finishReason，而非“每个 token 都执行 after”或“流结束后执行一次”。
 			if (AdvisorUtils.onFinishReason().test(response)) {
 				response = after(response, streamAdvisorChain);
 			}

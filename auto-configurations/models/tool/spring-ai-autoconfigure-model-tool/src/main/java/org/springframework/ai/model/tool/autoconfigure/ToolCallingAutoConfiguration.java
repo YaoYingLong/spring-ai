@@ -48,6 +48,13 @@ import org.springframework.util.ClassUtils;
 
 /**
  * Auto-configuration for common tool calling features of {@link ChatModel}.
+ * <p>
+ * 中文导读：装配工具名称解析器、执行异常处理器与 ToolCallingManager，并绑定
+ * {@code spring.ai.tools} 下的属性。它只准备执行基础设施，启动时不会调用业务工具。
+ * <p>
+ * 供应商模型使用管理器把回调转成工具定义，ChatClient 的 {@code ToolCallingAdvisor}
+ * 使用管理器执行模型提出的调用；“工具可被解析”和“本轮允许执行”属于不同职责。
+ * 每个基础设施 Bean 都有缺失条件，应用可以替换其中一层，保留其余默认装配。
  *
  * @author Thomas Vitale
  * @author Christian Tzolov
@@ -73,6 +80,10 @@ public class ToolCallingAutoConfiguration {
 	 * functions, and {@link ToolCallbackProvider} beans.
 	 * <p>
 	 * MCP providers are excluded, to avoid initializing them early with #listTools().
+	 * <p>
+	 * 当前装配收集 ToolCallback Bean，以及非 MCP 的 ToolCallbackProvider 提供的回调，
+	 * 放入 StaticToolCallbackResolver。普通 Java 工具方法需要先包装成回调，
+	 * 此方法不会只凭任意业务 Bean 的名称就反射执行它。
 	 */
 	@Bean
 	@ConditionalOnMissingBean
@@ -83,6 +94,7 @@ public class ToolCallingAutoConfiguration {
 			ObjectProvider<List<ToolCallbackProvider>> tcbProviderList,
 			ObjectProvider<ToolCallbackProvider> tcbProviders) { // @formatter:on
 
+		// 1. 直接注册的回调作为基础集合；Provider 还有旧式 List Bean 和独立 Bean 两条兼容入口。
 		List<ToolCallback> allFunctionAndToolCallbacks = new ArrayList<>(toolCallbacks);
 
 		// Merge ToolCallbackProviders from both ObjectProviders.
@@ -93,17 +105,20 @@ public class ToolCallingAutoConfiguration {
 		// De-duplicate ToolCallbackProviders
 		totalToolCallbackProviders = totalToolCallbackProviders.stream().distinct().toList();
 
+		// 2. Provider 去重后取回调。MCP Provider 的取值可能触发远程发现，故在此明确排除。
 		totalToolCallbackProviders.stream()
 			.filter(pr -> !isMcpToolCallbackProvider(ResolvableType.forInstance(pr)))
 			.map(pr -> List.of(pr.getToolCallbacks()))
 			.forEach(allFunctionAndToolCallbacks::addAll);
 
+		// 3. 当前默认委托链只有静态解析器，解析目标是工具定义中的名称。
 		var staticToolCallbackResolver = new StaticToolCallbackResolver(allFunctionAndToolCallbacks);
 
 		return new DelegatingToolCallbackResolver(List.of(staticToolCallbackResolver));
 	}
 
 	private static boolean isMcpToolCallbackProvider(ResolvableType type) {
+		// 按完整类型名识别并沿父类递归，避免当前自动配置模块对 MCP 实现建立编译依赖。
 		if (type.getType().getTypeName().equals("org.springframework.ai.mcp.SyncMcpToolCallbackProvider")
 				|| type.getType().getTypeName().equals("org.springframework.ai.mcp.AsyncMcpToolCallbackProvider")) {
 			return true;
@@ -115,6 +130,7 @@ public class ToolCallingAutoConfiguration {
 	@Bean
 	@ConditionalOnMissingBean
 	ToolExecutionExceptionProcessor toolExecutionExceptionProcessor(ToolCallingProperties properties) {
+		// 异常策略由管理器执行工具时使用，和远程模型 SDK 的 HTTP 重试/异常处理是两条链路。
 		ArrayList<Class<? extends RuntimeException>> rethrownExceptions = new ArrayList<>();
 
 		// ClientAuthorizationException is used by Spring Security in oauth2 flows,
@@ -126,6 +142,8 @@ public class ToolCallingAutoConfiguration {
 			rethrownExceptions.add(oauth2Exception);
 		}
 
+		// OAuth2 授权异常保留原异常向外抛出；其余按处理器的异常类型规则和 alwaysThrow 设置处理。
+		// alwaysThrow=false 允许普通工具运行时失败转成结果文本，并非吞掉所有异常。
 		return DefaultToolExecutionExceptionProcessor.builder()
 			.alwaysThrow(properties.isThrowExceptionOnError())
 			.rethrowExceptions(rethrownExceptions)
@@ -138,12 +156,15 @@ public class ToolCallingAutoConfiguration {
 			ToolExecutionExceptionProcessor toolExecutionExceptionProcessor, ToolCallingProperties properties,
 			ObjectProvider<ObservationRegistry> observationRegistry,
 			ObjectProvider<ToolCallingObservationConvention> observationConvention) {
+		// 1. 组合名称解析、失败处理、观测和解析回退策略；这里创建管理器，不发起模型请求。
 		var builder = ToolCallingManager.builder()
 			.observationRegistry(observationRegistry.getIfUnique(() -> ObservationRegistry.NOOP))
 			.toolCallbackResolver(toolCallbackResolver)
 			.toolExecutionExceptionProcessor(toolExecutionExceptionProcessor)
 			.resolutionFallbackEnabled(properties.getResolution().getFallback().isEnabled());
 
+		// 2. 把配置值翻译为 Builder 契约：-1 表示显式不限次数，null 则保留 Builder 自己的默认值。
+		// 先设置每工具默认值，再设置指定工具覆盖和排除项，最后设置整轮总次数上限。
 		ToolCallingProperties.Limits limits = properties.getLimits();
 
 		Integer maxCallsPerToolDefault = limits.getMaxCallsPerToolDefault();
@@ -165,6 +186,7 @@ public class ToolCallingAutoConfiguration {
 			}
 		});
 
+		// 排除只免除该工具的单工具上限，调用仍计入 maxTotalToolCalls。
 		limits.getExcludedTools().forEach(builder::excludeToolFromLimit);
 
 		Integer maxTotalToolCalls = limits.getMaxTotalToolCalls();
@@ -177,6 +199,7 @@ public class ToolCallingAutoConfiguration {
 			}
 		}
 
+		// 达到限制后的行为由配置决定，实际计数和执行阶段的判断在管理器内部完成。
 		builder.onLimitExceeded(limits.getOnLimitExceeded());
 
 		var toolCallingManager = builder.build();
@@ -191,6 +214,7 @@ public class ToolCallingAutoConfiguration {
 	@ConditionalOnProperty(prefix = ToolCallingProperties.CONFIG_PREFIX + ".observations", name = "include-content",
 			havingValue = "true")
 	ToolCallingContentObservationFilter toolCallingContentObservationFilter() {
+		// 只有显式 include-content=true 才把工具参数与结果纳入 Observation，基础指标不依赖此过滤器。
 		logger.warn(
 				"You have enabled the inclusion of the tool call arguments and result in the observations, with the risk of exposing sensitive or private information. Please, be careful!");
 		return new ToolCallingContentObservationFilter();

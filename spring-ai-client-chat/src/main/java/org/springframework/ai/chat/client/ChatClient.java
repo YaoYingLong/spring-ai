@@ -50,6 +50,27 @@ import org.springframework.util.MimeType;
  * Client to perform stateless requests to an AI Model, using a fluent API.
  * <p>
  * Use {@link ChatClient#builder(ChatModel)} to prepare an instance.
+ * <p>
+ * 中文阅读入口：这是应用侧的对话编排 API，负责把用户输入、模板变量、工具、Advisor
+ * 和模型选项组合起来。真正与模型服务通信的是 {@link ChatModel} 的具体实现。
+ * 可以沿以下顺序阅读一次请求：
+ * <ol>
+ * <li>{@link DefaultChatClientBuilder} 保存客户端默认配置。</li>
+ * <li>{@link DefaultChatClient#prompt()} 从默认配置创建本次请求的可变 Spec。</li>
+ * <li>{@code DefaultChatClientUtils.toChatClientRequest} 渲染模板、组装消息与选项。</li>
+ * <li>{@code DefaultAroundAdvisorChain} 执行记忆、检索、工具等拦截逻辑。</li>
+ * <li>{@code ChatModelCallAdvisor} 或 {@code ChatModelStreamAdvisor} 调用模型。</li>
+ * </ol>
+ * <p>
+ * 例如 {@code client.prompt().user("解释这段代码").call().content()} 中，
+ * {@code call()} 先选择同步响应入口，{@code content()} 才触发调用链并提取文本。
+ * 流式入口 {@code stream().content()} 返回 Flux，订阅时才执行链路。
+ * {@code content()}、{@code chatResponse()}、{@code chatClientResponse()} 分别保留
+ * 文本、模型响应及其元数据、以及 Advisor 上下文；读取 Advisor context 时应保留最外层响应。
+ * <p>
+ * “无状态请求”表示客户端不会自动把上一次对话拼进下一次 Prompt。
+ * 跨请求的会话历史需要显式配置记忆 Advisor，并传入相应的 conversationId。
+ * 工具循环则由默认注册的 {@link ToolCallingAdvisor} 负责。
  *
  * @author Mark Pollack
  * @author Christian Tzolov

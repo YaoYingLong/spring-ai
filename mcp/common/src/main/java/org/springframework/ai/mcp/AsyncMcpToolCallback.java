@@ -43,6 +43,16 @@ import org.springframework.util.StringUtils;
  * Bridges Model Context Protocol (MCP) tools with Spring AI's tool system, enabling
  * seamless integration of MCP tools in Spring AI applications.
  *
+ * <p>
+ * 中文导读：这里的 Async 描述所适配的 McpAsyncClient，ToolCallback 的 call 仍同步返回 String。
+ * 因此本类订阅 MCP 客户端返回的 Mono，并用 block 等待完整结果；它不是一个返回 Mono 的工具 SPI。
+ * ChatClient 的流式工具循环会在 boundedElastic 上执行此回调，直接调用者也需要考虑这个阻塞边界。
+ *
+ * <p>
+ * 工具定义来自服务端的 Tool，模型选中适配名后，本类用服务端原名发起 MCP tools/call。
+ * 客户端由外部创建和管理，本类不负责初始化或关闭它，也不会在每次工具调用后断开连接。
+ * 外层聊天流的取消不能推导为远端操作已停止或已回滚；远端终止仍取决于客户端、传输与服务端。
+ *
  * @author Christian Tzolov
  * @author YunKui Lu
  * @author Ilayaperumal Gopinathan
@@ -95,6 +105,7 @@ public class AsyncMcpToolCallback implements ToolCallback {
 
 	@Override
 	public ToolDefinition getToolDefinition() {
+		// 对模型暴露适配名和规范化的输入 Schema；真正发往 MCP 服务端的名称仍是 this.tool.name()。
 		return McpToolUtils.createToolDefinition(this.prefixedToolName, this.tool);
 	}
 
@@ -119,10 +130,13 @@ public class AsyncMcpToolCallback implements ToolCallback {
 			toolCallInput = "{}";
 		}
 
+		// 模型提供的 JSON 参数是 MCP arguments；解析发生在 try 外，失败不会被下方 catch 统一包装。
 		Map<String, Object> arguments = jsonHelper.fromJsonToMap(toolCallInput);
 
 		CallToolResult response;
 		try {
+			// ToolContext 是应用提供的另一条数据通道，经转换器进入 MCP _meta。
+			// 默认转换器会发送除 exchange 和 null 值以外的条目，并非只把它留在本地线程中。
 			var mcpMeta = toolContext != null ? this.toolContextToMcpMetaConverter.convert(toolContext) : null;
 
 			// Use the original tool name, not the prefixed one from getToolDefinition
@@ -131,12 +145,16 @@ public class AsyncMcpToolCallback implements ToolCallback {
 			// Only map non-McpError exceptions to ToolExecutionException. McpError is a
 			// protocol-level signal (e.g. URL elicitation) that must propagate as a hard
 			// failure rather than being conveyed to the model as an error result.
+			// block 会建立内部订阅，需要用 contextWrite 重新注入工具 Advisor 捕获的 Reactor Context。
+			// 该 Context 用于 observation 等链路信息，与上面发送给服务端的 ToolContext/_meta 分属不同用途。
+			// 本适配没有额外的取消令牌或远端回滚逻辑；等待和取消语义沿用底层 Mono/MCP 客户端。
 			response = this.mcpClient.callTool(request).onErrorMap(e -> !(e instanceof McpError), e -> {
 				logger.error("Exception while tool calling: ", e);
 				return new ToolExecutionException(this.getToolDefinition(), e);
 			}).contextWrite(ctx -> ctx.putAll(ToolCallReactiveContextHolder.getContext())).block();
 		}
 		catch (McpError ex) {
+			// 协议级错误保持原样向上抛出；Manager 只捕获 ToolExecutionException，因此会终止本次交互。
 			logger.error("Protocol error while calling tool: ", ex);
 			// Since the tool calling manager only handles ToolExecutionException, this
 			// bubbles up and fails the model interaction.
@@ -149,12 +167,14 @@ public class AsyncMcpToolCallback implements ToolCallback {
 		Assert.notNull(response, "response was null");
 
 		if (response.isError() != null && response.isError()) {
+			// 收到了有效 MCP 响应但工具执行失败，可交由 Manager 的异常策略生成模型可读的错误结果。
 			if (logger.isErrorEnabled()) {
 				logger.error("Error calling tool: " + response.content());
 			}
 			throw new ToolExecutionException(this.getToolDefinition(),
 					new IllegalStateException("Error calling tool: " + response.content()));
 		}
+		// 将内容块列表序列化成工具结果字符串；当前路径不读取 CallToolResult 的 structuredContent。
 		return jsonHelper.toJson(response.content());
 	}
 
@@ -235,6 +255,7 @@ public class AsyncMcpToolCallback implements ToolCallback {
 			Assert.notNull(this.tool, "MCP tool must not be null");
 
 			// Apply defaults if not specified
+			// 当前 builder 默认只格式化原工具名，跨 MCP 连接的去冲突前缀由 Provider 或调用方传入。
 			if (this.prefixedToolName == null) {
 				this.prefixedToolName = McpToolUtils.format(this.tool.name());
 			}

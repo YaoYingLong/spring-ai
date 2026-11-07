@@ -43,6 +43,13 @@ import org.springframework.util.StreamUtils;
  * A template for creating prompts. It allows you to define a template string with
  * placeholders for variables, and then render the template with specific values for those
  * variables.
+ * <p>
+ * 中文导读：这是本地文本模板阶段，不会调用模型。模板和 variables 交给 TemplateRenderer
+ * 替换占位符，render() 返回字符串，createMessage()/create() 再包装为用户消息或 Prompt。
+ * 默认使用 StTemplateRenderer；自定义渲染语法应替换 renderer，而不必继承本类。
+ * <p>
+ * ChatClient 的 system/user 参数也会经此路径渲染。模板变量用于构造消息正文，
+ * 与 ChatOptions 中控制模型生成的 temperature 等参数，以及 Advisor context 均是不同层次。
  */
 public class PromptTemplate implements PromptTemplateActions, PromptTemplateMessageActions {
 
@@ -124,6 +131,7 @@ public class PromptTemplate implements PromptTemplateActions, PromptTemplateMess
 
 	@Override
 	public String render(Map<String, Object> additionalVariables) {
+		// 本次调用的同名变量覆盖模板默认值，合并发生在新 Map 中，不污染下次渲染的默认变量。
 		Map<String, @Nullable Object> combinedVariables = new HashMap<>();
 		Map<String, Object> mergedVariables = new HashMap<>(this.variables);
 		// variables + additionalVariables => mergedVariables
@@ -131,6 +139,7 @@ public class PromptTemplate implements PromptTemplateActions, PromptTemplateMess
 			mergedVariables.putAll(additionalVariables);
 		}
 
+		// Resource 变量先读取为文本，其他值交给渲染器解释；不是把资源对象的 toString() 拼进提示词。
 		for (Entry<String, Object> entry : mergedVariables.entrySet()) {
 			if (entry.getValue() instanceof Resource resource) {
 				combinedVariables.put(entry.getKey(), renderResource(resource));
@@ -204,6 +213,7 @@ public class PromptTemplate implements PromptTemplateActions, PromptTemplateMess
 
 	@Override
 	public Prompt create(Map<String, Object> additionalVariables, ChatOptions modelOptions) {
+		// 模板最终生成单条 user 消息；需要 system/历史/tool 等复杂对话结构时应显式组装 Prompt。
 		return Prompt.builder().content(render(additionalVariables)).chatOptions(modelOptions).build();
 	}
 

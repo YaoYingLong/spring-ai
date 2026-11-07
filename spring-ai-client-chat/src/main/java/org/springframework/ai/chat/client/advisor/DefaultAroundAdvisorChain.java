@@ -50,6 +50,14 @@ import org.springframework.util.CollectionUtils;
  * Default implementation for the {@link BaseAdvisorChain}. Used by the {@link ChatClient}
  * to delegate the call to the next {@link CallAdvisor} or {@link StreamAdvisor} in the
  * chain.
+ * <p>
+ * 中文导读：这是责任链的运行时执行器，可以类比 Servlet Filter 的嵌套调用。
+ * Advisor 调用 nextCall/nextStream 才继续向下，也可以直接返回以短路后续处理。
+ * 同步和流式按各自接口拆成两条队列；只实现 CallAdvisor 的组件不会参与流式请求。
+ * <p>
+ * 请求按 order 从小到大进入，返回逻辑按调用栈逐层退出。
+ * 原始 Advisor 列表保留完整拓扑，Deque 保存当前尚未执行的节点；next 操作会 pop，
+ * 因而链实例是一次执行的游标。工具循环或重试必须复制下游链，不能重用已经耗尽的队列。
  *
  * @author Christian Tzolov
  * @author Dariusz Jedrzejczyk
@@ -102,6 +110,7 @@ public class DefaultAroundAdvisorChain implements BaseAdvisorChain {
 			throw new IllegalStateException("No CallAdvisors available to execute");
 		}
 
+		// 每次只取一个节点，是否继续以及何时继续，由该 Advisor 调用本链的 nextCall 决定。
 		var advisor = this.callAdvisors.pop();
 
 		var observationContext = AdvisorObservationContext.builder()
@@ -124,6 +133,7 @@ public class DefaultAroundAdvisorChain implements BaseAdvisorChain {
 	public Flux<ChatClientResponse> nextStream(ChatClientRequest chatClientRequest) {
 		Assert.notNull(chatClientRequest, "the chatClientRequest cannot be null");
 
+		// 流式节点的取出也推迟到订阅时；构建 Flux 本身不应提前消费链上的节点。
 		return Flux.deferContextual(contextView -> {
 			if (this.streamAdvisors.isEmpty()) {
 				return Flux.error(new IllegalStateException("No StreamAdvisors available to execute"));
@@ -140,6 +150,7 @@ public class DefaultAroundAdvisorChain implements BaseAdvisorChain {
 			var observation = AdvisorObservationDocumentation.AI_ADVISOR.observation(this.observationConvention,
 					DEFAULT_OBSERVATION_CONVENTION, () -> observationContext, this.observationRegistry);
 
+			// 父子观测沿 Reactor Context 传递；线程切换后，当前线程的观测不一定是本请求的父节点。
 			Observation parentObservation = contextView.getOrDefault(ObservationThreadLocalAccessor.KEY, null);
 			observation.parentObservation(parentObservation);
 			// Briefly make the parent observation current while starting this one, so
@@ -177,6 +188,8 @@ public class DefaultAroundAdvisorChain implements BaseAdvisorChain {
 
 	private DefaultAroundAdvisorChain copyAdvisorsAfter(List<? extends Advisor> advisors, Advisor after) {
 
+		// 依据原始列表定位当前 Advisor，只复制它后面的节点，既重置游标，也避免递归进入自己。
+		// 例如工具执行结束后，下一轮需要再次经过下游记忆/检索/模型节点。
 		Assert.notNull(after, "The after advisor must not be null");
 		Assert.notNull(advisors, "The advisors must not be null");
 
@@ -248,6 +261,7 @@ public class DefaultAroundAdvisorChain implements BaseAdvisorChain {
 			Assert.notNull(advisors, "the advisors must be non-null");
 			Assert.noNullElements(advisors, "the advisors must not contain null elements");
 			if (!CollectionUtils.isEmpty(advisors)) {
+				// 同一对象可以同时实现两个接口并进入两条链；两条链分别排序和消费。
 				List<CallAdvisor> callAroundAdvisorList = advisors.stream()
 					.filter(a -> a instanceof CallAdvisor)
 					.map(a -> (CallAdvisor) a)
@@ -275,6 +289,7 @@ public class DefaultAroundAdvisorChain implements BaseAdvisorChain {
 		 * (Re)orders the advisors in priority order based on their Ordered attribute.
 		 */
 		private void reOrder() {
+			// 按 Ordered 数值升序执行；不要把 pushAll 的传入顺序当成不同 order 节点的执行顺序。
 			ArrayList<CallAdvisor> callAdvisors = new ArrayList<>(this.callAdvisors);
 			OrderComparator.sort(callAdvisors);
 			this.callAdvisors.clear();

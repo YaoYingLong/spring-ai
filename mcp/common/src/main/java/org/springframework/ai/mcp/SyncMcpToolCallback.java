@@ -39,6 +39,17 @@ import org.springframework.util.StringUtils;
  * Synchronous adapter bridging MCP tools to Spring AI's {@link ToolCallback} interface.
  * Handles tool execution and data conversion between MCP and Spring AI.
  *
+ * <p>
+ * 中文导读：把 MCP 服务端公布的一项 Tool 包装成 Spring AI 工具。
+ * Provider 通常先通过 listTools 发现工具，再传入 MCP 客户端、工具描述和对模型暴露的名称；
+ * 模型选择此工具后，ToolCallingManager 调用本类，把 JSON 参数转成 MCP tools/call 请求。
+ * 本类借用外部传入的客户端，不负责初始化、关闭连接或管理服务端生命周期。
+ *
+ * <p>
+ * 模型看到的 prefixedToolName 用于避免不同 MCP 连接之间名称冲突，
+ * 发往服务端的请求则必须使用 tool.name() 原名；名称适配不会改变服务端工具的真实身份。
+ * 这里同步等待一个完整 CallToolResult，没有把 MCP 工具输出逐块映射成聊天流的机制。
+ *
  * @author Christian Tzolov
  * @author YunKui Lu
  * @author Ilayaperumal Gopinathan
@@ -92,6 +103,7 @@ public class SyncMcpToolCallback implements ToolCallback {
 
 	@Override
 	public ToolDefinition getToolDefinition() {
+		// 工具用途和输入 Schema 来自服务端的 Tool；工具名使用本地适配名，Schema 经公共工具类规范化。
 		return McpToolUtils.createToolDefinition(this.prefixedToolName, this.tool);
 	}
 
@@ -120,10 +132,13 @@ public class SyncMcpToolCallback implements ToolCallback {
 			toolCallInput = "{}";
 		}
 
+		// 模型生成的 JSON 参数转成 MCP arguments；此解析在 try 之外，失败不走下面的异常包装分支。
 		Map<String, Object> arguments = jsonHelper.fromJsonToMap(toolCallInput);
 
 		CallToolResult response;
 		try {
+			// 应用 ToolContext 经转换器写入 MCP _meta，而不是混入模型生成的 arguments。
+			// 默认转换器过滤 exchange 和 null 值，其余条目会发送到 MCP 服务端。
 			var mcpMeta = toolContext != null ? this.toolContextToMcpMetaConverter.convert(toolContext) : null;
 
 			// Use the original tool name, not the prefixed one from getToolDefinition
@@ -131,6 +146,7 @@ public class SyncMcpToolCallback implements ToolCallback {
 
 			// Note that we use the original tool name here, not the adapted one from
 			// getToolDefinition
+			// 在 Manager 当前线程阻塞等待；超时和传输层取消由配置好的 MCP 客户端承担。
 			response = this.mcpClient.callTool(request);
 		}
 		catch (McpError ex) {
@@ -148,12 +164,15 @@ public class SyncMcpToolCallback implements ToolCallback {
 		}
 
 		if (response.isError() != null && response.isError()) {
+			// MCP 正常返回但工具执行失败，与上面的协议级 McpError 分开处理。
+			// 包成 ToolExecutionException 后，Manager 的策略可选择向模型提供错误内容或向调用方抛出。
 			if (logger.isErrorEnabled()) {
 				logger.error("Error calling tool: " + response.content());
 			}
 			throw new ToolExecutionException(this.getToolDefinition(),
 					new IllegalStateException("Error calling tool: " + response.content()));
 		}
+		// 返回 content 列表的 JSON，保留内容块类型；这里没有直接返回完整 MCP 响应或 structuredContent。
 		return jsonHelper.toJson(response.content());
 	}
 
@@ -231,6 +250,8 @@ public class SyncMcpToolCallback implements ToolCallback {
 			Assert.notNull(this.tool, "MCP tool must not be null");
 
 			// Apply defaults if not specified
+			// 单独使用 builder 时仅格式化工具原名；跨连接的前缀通常由 Provider 显式传入。
+			// 这与上方已废弃构造器自动拼接客户端名称的路径不同。
 			if (this.prefixedToolName == null) {
 				this.prefixedToolName = McpToolUtils.format(this.tool.name());
 			}

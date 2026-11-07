@@ -35,6 +35,11 @@ import org.springframework.util.StringUtils;
 
 /**
  * A {@link CallAdvisor} that uses a {@link ChatModel} to generate a response.
+ * <p>
+ * 中文导读：同步 Advisor 链的终点。上游已完成记忆、检索、工具上下文等处理，
+ * 这里将最终 Prompt 交给模型，并把请求 context 带回响应供上游读取。
+ * 本节点不再调用 nextCall，getOrder() 使用最低优先级，使它处于常规 Advisor 之后。
+ * 工具循环的多轮请求会多次进入这个终点，但每次只执行一次 ChatModel.call。
  *
  * @author Thomas Vitale
  * @author Christian Tzolov
@@ -74,12 +79,15 @@ public final class ChatModelCallAdvisor implements CallAdvisor {
 			return chatClientRequest;
 		}
 
+		// entity(...) 先将格式/Schema 放入 context。原生模式且选项支持 Schema 时，通过模型参数传递。
+		// 其余情况将格式说明追加到最后一条用户消息，依靠提示词约束模型输出。
 		boolean usesNativeStructuredOutput = chatClientRequest.context()
 			.containsKey(ChatClientAttributes.STRUCTURED_OUTPUT_NATIVE.getKey());
 
 		if (usesNativeStructuredOutput && StringUtils.hasText(outputSchema) && chatClientRequest.prompt()
 			.getOptions() instanceof StructuredOutputChatOptions structuredOutputChatOptions) {
 
+			// 从原有选项派生新对象，保留模型及工具配置；这里不执行 Schema 校验或反序列化。
 			var augmentedOptions = structuredOutputChatOptions.mutate().outputSchema(outputSchema).build();
 			Prompt augmentedPrompt = chatClientRequest.prompt().mutate().chatOptions(augmentedOptions).build();
 

@@ -55,6 +55,17 @@ import org.springframework.context.annotation.Scope;
  * This will produce a {@link ChatClient.Builder ChatClient.Builder} bean with the
  * {@code prototype} scope, meaning each injection point will receive a newly cloned
  * instance of the builder.
+ * <p>
+ * 中文导读：这一层把底层 ChatModel、客户端/Advisor 观测和定制器接到 ChatClient.Builder。
+ * 默认启用，可用 {@code spring.ai.chat.client.enabled=false} 关闭；
+ * 各 Bean 的 ConditionalOnMissingBean 允许应用替换对应装配部件。
+ * <p>
+ * 自动配置提供的是 prototype Builder，应用通常注入后再调用 build() 创建 ChatClient。
+ * 每次从容器获取 Builder 都运行本工厂方法，避免不同注入点共享可变的默认提示词/Advisor 设置。
+ * 创建 Builder 时必须能解析出要注入的 ChatModel，本类不在多个 provider 之间自行挑选模型。
+ * <p>
+ * ToolCallingAutoConfiguration 先准备工具管理器，本类再把它接入 ToolCallingAdvisor 的构建器；
+ * 因而本地工具执行与多轮模型调用属于客户端 Advisor 链，而非供应商模型适配器。
  *
  * @author Christian Tzolov
  * @author Mark Pollack
@@ -88,6 +99,7 @@ public class ChatClientAutoConfiguration {
 	@SuppressWarnings("removal")
 	ChatClientBuilderConfigurer chatClientBuilderConfigurer(ObjectProvider<ChatClientCustomizer> customizerProvider,
 			ObjectProvider<ChatClientBuilderCustomizer> builderCustomizerProvider) {
+		// 各类定制器分别按 Spring 顺序收集；Configurer 先应用旧 customizer，再应用新的 builder customizer。
 		ChatClientBuilderConfigurer configurer = new ChatClientBuilderConfigurer();
 		configurer.setChatClientCustomizers(customizerProvider.orderedStream().toList());
 		configurer.setChatClientBuilderCustomizers(builderCustomizerProvider.orderedStream().toList());
@@ -100,6 +112,8 @@ public class ChatClientAutoConfiguration {
 	ToolCallingAdvisor.Builder<?> toolCallingAdvisorBuilder(ChatClientBuilderProperties properties,
 			ToolCallingManager toolCallingManager,
 			ObjectProvider<ToolExecutionEligibilityChecker> toolExecutionEligibilityChecker) {
+		// 复用容器中的管理器，保留其工具解析、异常策略、调用次数限制和观测配置。
+		// eligibility checker 决定一轮响应是否需要执行工具；order 决定此 Advisor 在链中的位置。
 		var builder = ToolCallingAdvisor.builder()
 			.toolCallingManager(toolCallingManager)
 			.advisorOrder(properties.getToolCalling().getAdvisorOrder());
@@ -118,16 +132,21 @@ public class ChatClientAutoConfiguration {
 			ObjectProvider<ChatClientObservationConvention> chatClientObservationConvention,
 			ObjectProvider<AdvisorObservationConvention> advisorObservationConvention,
 			ObjectProvider<ToolCallingAdvisor.Builder<?>> toolCallingAdvisorBuilder) {
+		// 1. 为这次容器获取创建新 Builder，同时传入模型、两层观测 Convention 和工具 Advisor 构建器。
+		// 这些 Observation 分别描述客户端请求、Advisor 和模型调用，不应理解为同一个记录对象。
 		ChatClient.Builder builder = ChatClient.builder(chatModel,
 				observationRegistry.getIfUnique(() -> ObservationRegistry.NOOP),
 				chatClientObservationConvention.getIfUnique(), advisorObservationConvention.getIfUnique(),
 				toolCallingAdvisorBuilder.getIfAvailable());
 		if (!properties.getToolCalling().isEnabled()) {
+			// 开关控制默认工具 Advisor 的自动注册，不删除容器中的工具定义或 ToolCallingManager。
 			builder.defaultAdvisors(AdvisorParams.toolCallingAdvisorAutoRegister(false));
 		}
+		// 2. 最后应用用户定制器；应用拿到 Builder 后还可继续设置并决定何时 build。
 		return chatClientBuilderConfigurer.configure(builder);
 	}
 
+	// Tracer 类与 Bean 同时存在才走此分支，内容日志处理器通过包装器关联当前 trace。
 	@Configuration(proxyBeanMethods = false)
 	@ConditionalOnClass(Tracer.class)
 	@ConditionalOnBean(Tracer.class)
@@ -157,6 +176,8 @@ public class ChatClientAutoConfiguration {
 
 	}
 
+	// 此备用分支要求 Tracer 类本身缺失；并非“有 Tracer 类但无 Bean”时也自动走这里。
+	// 两种日志都需要显式开启相应属性，默认装配 Builder 不会启用提示词/回答内容日志。
 	@Configuration(proxyBeanMethods = false)
 	@ConditionalOnMissingClass("io.micrometer.tracing.Tracer")
 	static class TracerNotPresentObservationConfiguration {

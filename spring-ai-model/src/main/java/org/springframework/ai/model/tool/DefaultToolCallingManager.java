@@ -57,6 +57,16 @@ import org.springframework.util.StringUtils;
 /**
  * Default implementation of {@link ToolCallingManager}.
  *
+ * <p>
+ * 中文导读：本类处理一次模型响应中的工具调用批次，不持有跨轮的可变计数，也不调用模型。
+ * 核心路径是选择包含工具请求的候选回答、解析回调、检查限额、逐个执行并组装 ToolResponseMessage。
+ * ToolCallingAdvisor 再把“旧历史 + assistant 工具请求 + tool 结果”传给下一轮模型。
+ *
+ * <p>
+ * 执行是当前线程上的串行 for 循环；即使模型一次返回多个工具调用，也不代表本实现并行运行它们。
+ * ChatClient 同步路径在调用线程执行，流式路径由工具 Advisor 切到 boundedElastic 后再进入这里。
+ * 单个工具的副作用已经发生时，后续工具失败或触发限额不会自动回滚先前执行。
+ *
  * @author Thomas Vitale
  * @author chabinhwang
  * @author Christian Tzolov
@@ -171,6 +181,7 @@ public final class DefaultToolCallingManager implements ToolCallingManager {
 		List<ToolCallback> toolCallbacks = new ArrayList<>(
 				!CollectionUtils.isEmpty(chatOptions.getToolCallbacks()) ? chatOptions.getToolCallbacks() : List.of());
 
+		// 只暴露请求选项中显式携带的定义；这里不会遍历 resolver 找出其他可用工具。
 		return toolCallbacks.stream().map(ToolCallback::getToolDefinition).toList();
 	}
 
@@ -179,6 +190,7 @@ public final class DefaultToolCallingManager implements ToolCallingManager {
 		Assert.notNull(prompt, "prompt cannot be null");
 		Assert.notNull(chatResponse, "chatResponse cannot be null");
 
+		// 一个响应可有多个候选 Generation，本实现只处理首个含 tool calls 的候选，不合并所有候选。
 		Optional<Generation> toolCallGeneration = chatResponse.getResults()
 			.stream()
 			.filter(g -> !CollectionUtils.isEmpty(g.getOutput().getToolCalls()))
@@ -190,6 +202,7 @@ public final class DefaultToolCallingManager implements ToolCallingManager {
 
 		AssistantMessage assistantMessage = toolCallGeneration.get().getOutput();
 
+		// ToolContext 来自 Prompt 选项中的应用数据，工具参数则来自 assistantMessage，两者不混合。
 		ToolContext toolContext = buildToolContext(prompt, assistantMessage);
 
 		InternalToolExecutionResult internalToolExecutionResult = executeToolCall(prompt, assistantMessage,
@@ -209,6 +222,7 @@ public final class DefaultToolCallingManager implements ToolCallingManager {
 
 		if (prompt.getOptions() instanceof ToolCallingChatOptions toolCallingChatOptions
 				&& !CollectionUtils.isEmpty(toolCallingChatOptions.getToolContext())) {
+			// 复制 Map 容器；本实现不会把对话历史或 assistantMessage 自动注入到 ToolContext 中。
 			toolContextMap = new HashMap<>(toolCallingChatOptions.getToolContext());
 		}
 
@@ -231,6 +245,8 @@ public final class DefaultToolCallingManager implements ToolCallingManager {
 
 		Boolean returnDirect = null;
 
+		// 从最后一条 UserMessage 开始统计已存在的工具结果，避免把之前用户轮次的调用计入本轮限额。
+		// Advisor 即使裁剪向后续链转发的 Prompt，也会单独保留完整本轮历史供此处重建计数。
 		Map<String, Integer> toolCallCounts = ToolCallLimits.countPriorToolCalls(prompt.getInstructions());
 		int totalToolCallCount = toolCallCounts.values().stream().mapToInt(Integer::intValue).sum();
 
@@ -247,6 +263,8 @@ public final class DefaultToolCallingManager implements ToolCallingManager {
 
 			ToolCallLimits.Breach limitBreach = this.toolCallLimits.check(toolName, toolCallCount, totalToolCallCount);
 			if (limitBreach != null) {
+				// 先判断再执行：超限调用不会触发回调。默认每个工具 40 次、所有工具合计 150 次。
+				// THROW 携带已完成部分并中断批次；RETURN_ERROR_RESPONSE 记录错误后继续处理余下调用。
 				toolResponses.add(new ToolResponseMessage.ToolResponse(toolCall.id(), toolName, limitBreach.message()));
 
 				if (this.toolCallLimits.onLimitExceeded() == ToolCallLimitBehavior.THROW) {
@@ -288,6 +306,8 @@ public final class DefaultToolCallingManager implements ToolCallingManager {
 				.findFirst()
 				.orElseGet(() -> this.resolutionFallbackEnabled ? this.toolCallbackResolver.resolve(toolName) : null);
 
+			// 默认只允许当前请求已附带的工具。只有显式启用 fallback，才允许通过 resolver 按名称补查。
+			// 因此拥有 resolver 不等于模型能调用其中任意工具，名称必须与定义精确对应。
 			if (toolCallback == null) {
 				if (logger.isWarnEnabled()) {
 					logger.warn(POSSIBLE_LLM_TOOL_NAME_CHANGE_WARNING_START + toolName
@@ -296,6 +316,8 @@ public final class DefaultToolCallingManager implements ToolCallingManager {
 				throw new IllegalStateException("No ToolCallback found for tool name: " + toolName);
 			}
 
+			// 对本批已解析回调的 returnDirect 做 AND：存在一个需要模型继续处理的工具，就继续模型循环。
+			// 该标志不会使 for 循环提前结束；本批工具都处理完成后才由 Advisor 决定直接返回。
 			if (returnDirect == null) {
 				returnDirect = toolCallback.getToolMetadata().returnDirect();
 			}
@@ -328,12 +350,15 @@ public final class DefaultToolCallingManager implements ToolCallingManager {
 						toolResult = toolCallback.call(finalToolInputArguments, toolContext);
 					}
 					catch (ToolExecutionException ex) {
+						// 只捕获此协议异常。默认处理器把 RuntimeException cause 转为结果文本，
+						// 但 checked exception、Error、配置为重抛的异常会继续向上失败；未包装的其他异常也会向上抛出。
 						toolResult = this.toolExecutionExceptionProcessor.process(ex);
 					}
 					observationContext.setToolCallResult(toolResult);
 					return toolResult;
 				});
 
+			// 响应沿用模型生成的调用 ID，使下轮模型能把每个结果对应回原来的工具请求。
 			toolResponses.add(new ToolResponseMessage.ToolResponse(toolCall.id(), toolName,
 					toolCallResult != null ? toolCallResult : ""));
 		}
@@ -344,6 +369,8 @@ public final class DefaultToolCallingManager implements ToolCallingManager {
 
 	private List<Message> buildConversationHistoryAfterToolExecution(List<Message> previousMessages,
 			AssistantMessage assistantMessage, ToolResponseMessage toolResponseMessage) {
+		// 必须保留发起工具调用的 assistant 消息，再追加聚合了本批结果的 tool 消息。
+		// 只把结果字符串拼到用户消息会丢失角色与 toolCallId 的对应关系；这里始终构造新列表。
 		List<Message> messages = new ArrayList<>(previousMessages);
 		messages.add(assistantMessage);
 		messages.add(toolResponseMessage);

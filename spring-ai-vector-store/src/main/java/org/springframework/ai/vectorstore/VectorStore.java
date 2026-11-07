@@ -36,6 +36,21 @@ import org.springframework.util.Assert;
  * similarity searches based on vector representations of data rather than exact matches.
  * This interface allows for adding, deleting, and searching documents based on their
  * similarity to a given query.
+ *
+ * <p>
+ * 中文导读：这是向量存储的统一业务入口，上接 ETL 写入和 RAG 检索，下接具体数据库适配器。
+ * DocumentWriter 的 accept 对接文档流水线，检索方法继承自 VectorStoreRetriever。
+ * 学习完整链路可按 Document、EmbeddingModel、SearchRequest、AbstractObservationVectorStore、
+ * SimpleVectorStore 的顺序阅读，再比较数据库实现如何转换过滤表达式和距离度量。
+ *
+ * <p>
+ * add 接收原始 Document，是否以及如何调用 embedding 由具体存储实现决定；
+ * upsert 则明确接收已经算好的向量，并要求按文档 id 替换已有记录。
+ * 普通 add 的重复 id 行为、批处理方式、过滤能力均需查看具体实现，接口没有替所有后端统一实现。
+ *
+ * <p>
+ * similaritySearch 返回相关 Document，分数受模型、相似度算法和后端转换影响。
+ * topK 是请求的结果数量目标，过滤、阈值和候选不足都可能让结果更少；相似度也不验证文档内容真伪。
  */
 public interface VectorStore extends DocumentWriter, VectorStoreRetriever {
 
@@ -52,6 +67,7 @@ public interface VectorStore extends DocumentWriter, VectorStoreRetriever {
 
 	@Override
 	default void accept(List<Document> documents) {
+		// 让 VectorStore 可直接作为 ETL 最后一步的 Consumer；实际写入仍走公开 add 入口。
 		add(documents);
 	}
 
@@ -76,6 +92,7 @@ public interface VectorStore extends DocumentWriter, VectorStoreRetriever {
 	 * @since 2.1.0
 	 */
 	default void upsert(List<EmbeddedDocument> entries) {
+		// 可选能力，不存在统一的 add 降级路径；未支持的后端不能假装已经按 id 替换成功。
 		throw new UnsupportedOperationException(getName() + " does not support upsert");
 	}
 
@@ -101,6 +118,7 @@ public interface VectorStore extends DocumentWriter, VectorStoreRetriever {
 	 * @throws IllegalStateException if the underlying delete causes an exception
 	 */
 	default void delete(String filterExpression) {
+		// 复用 SearchRequest 的字符串解析入口，只借它生成表达式树，不会执行一次相似度查询。
 		SearchRequest searchRequest = SearchRequest.builder().filterExpression(filterExpression).build();
 		Filter.Expression textExpression = searchRequest.getFilterExpression();
 		Assert.notNull(textExpression, "Filter expression must not be null");
@@ -128,6 +146,8 @@ public interface VectorStore extends DocumentWriter, VectorStoreRetriever {
 	/**
 	 * Builder interface for creating VectorStore instances. Implements a fluent builder
 	 * pattern for configuring observation-related settings.
+	 * <p>
+	 * 泛型参数使通用配置方法返回具体 builder 类型；batchingStrategy 是否用于写入取决于实现类。
 	 *
 	 * @param <T> the concrete builder type, enabling method chaining with the correct
 	 * return type

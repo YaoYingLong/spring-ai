@@ -50,6 +50,18 @@ import org.springframework.util.CollectionUtils;
 
 /**
  * Embedding Model implementation using the OpenAI Java SDK.
+ * <p>
+ * 中文导读：把 Spring AI 的文本批次转换成 OpenAI embeddings 请求，再把返回的数值列表
+ * 转成 {@code float[]}。模型只负责向量计算，不负责切分文档、保存向量或执行相似度检索。
+ * <p>
+ * 主链是 {@code embed(Document) -> call(EmbeddingRequest) -> embeddings().create}
+ * 再到 {@code generateEmbeddingResponse}；批量调用直接传入包含多条文本的 EmbeddingRequest。
+ * 文档走 {@link MetadataMode} 格式化后才变成模型输入，元数据是否参与向量内容由该模式决定。
+ * <p>
+ * 请求 options 通过 builder 合并到模型默认 options，具体字段遵守
+ * {@link OpenAiEmbeddingOptions.Builder#merge} 的规则；连接客户端只在构造时确定。
+ * {@code dimensions()} 继承父类的探测与缓存逻辑，首次查询可能触发一次真实 embedding 调用；
+ * 请求中的 dimensions 参数只传给服务端，本类不在本地截断或补齐返回向量。
  *
  * @author Julien Dubois
  * @author Soby Chacko
@@ -187,9 +199,11 @@ public class OpenAiEmbeddingModel extends AbstractEmbeddingModel {
 	}
 
 	private OpenAiEmbeddingModel(Builder builder) {
+		// 默认把文档用于 EMBED 的元数据纳入格式化内容；没有注册表时仍可通过 NOOP 保持同一调用链。
 		this.options = Objects.requireNonNullElseGet(builder.options, () -> OpenAiEmbeddingOptions.builder().build());
 		this.metadataMode = Objects.requireNonNullElse(builder.metadataMode, MetadataMode.EMBED);
 		this.observationRegistry = Objects.requireNonNullElse(builder.observationRegistry, ObservationRegistry.NOOP);
+		// 用户提供客户端则直接复用；否则在这里一次性确定地址、凭据、超时、重试与 HTTP 定制。
 		this.openAiClient = Objects.requireNonNullElseGet(builder.openAiClient,
 				() -> OpenAiSetup.setupSyncClient(this.options.getBaseUrl(), this.options.getApiKey(),
 						this.options.getCredential(), this.options.getMicrosoftDeploymentName(),
@@ -203,11 +217,13 @@ public class OpenAiEmbeddingModel extends AbstractEmbeddingModel {
 	@Override
 	public String getEmbeddingContent(Document document) {
 		Assert.notNull(document, "Document must not be null");
+		// 批量文档入口也可使用此方法，保证文本格式化与下面单文档 embed 的策略一致。
 		return document.getFormattedContent(this.metadataMode);
 	}
 
 	@Override
 	public float[] embed(Document document) {
+		// 单文档只是批量协议的一条输入；响应为空时返回空数组，否则取首条向量。
 		EmbeddingResponse response = this
 			.call(new EmbeddingRequest(List.of(document.getFormattedContent(this.metadataMode)), this.options));
 
@@ -219,6 +235,8 @@ public class OpenAiEmbeddingModel extends AbstractEmbeddingModel {
 
 	@Override
 	public EmbeddingResponse call(EmbeddingRequest embeddingRequest) {
+		// 1. 复制模型选项，再按 merge 规则合入本次选项；model/dimensions 等非空值可覆盖默认值。
+		// OpenAI 专有字段另有规则，例如 headers/extraBody 按键合并，timeout 直接采用传入对象的值。
 		OpenAiEmbeddingOptions options = OpenAiEmbeddingOptions.builder()
 			.from(this.options)
 			.merge(embeddingRequest.getOptions())
@@ -227,6 +245,8 @@ public class OpenAiEmbeddingModel extends AbstractEmbeddingModel {
 		EmbeddingRequest embeddingRequestWithMergedOptions = new EmbeddingRequest(embeddingRequest.getInstructions(),
 				options);
 
+		// 2. 将 List<String> 作为一个 SDK 批次输入，并映射模型/部署名、编码格式、维度和扩展参数。
+		// 此方法不按 token 数拆批；调用方或上层 VectorStore 的批处理策略决定每次请求包含哪些文本。
 		EmbeddingCreateParams embeddingCreateParams = options
 			.toOpenAiCreateParams(embeddingRequestWithMergedOptions.getInstructions());
 
@@ -235,6 +255,7 @@ public class OpenAiEmbeddingModel extends AbstractEmbeddingModel {
 					+ embeddingCreateParams);
 		}
 
+		// 3. 仅 timeout 进入 SDK 请求级 RequestOptions；合并 options 不会重新建立连接客户端。
 		RequestOptions requestOptions = this.buildRequestOptions(options);
 
 		var observationContext = EmbeddingModelObservationContext.builder()
@@ -242,6 +263,8 @@ public class OpenAiEmbeddingModel extends AbstractEmbeddingModel {
 			.provider(AiProvider.OPENAI.value())
 			.build();
 
+		// 4. 同步模型 Observation 包住 SDK 调用和结果转换，记录模型、输入与响应用量。
+		// 调用/转换异常沿当前线程向外传播；本层没有额外重试循环，SDK 使用客户端构造时的重试设置。
 		return Objects.requireNonNull(
 				EmbeddingModelObservationDocumentation.EMBEDDING_MODEL_OPERATION
 					.observation(this.observationConvention, DEFAULT_OBSERVATION_CONVENTION, () -> observationContext,
@@ -258,6 +281,8 @@ public class OpenAiEmbeddingModel extends AbstractEmbeddingModel {
 
 	/**
 	 * Creates a RequestOptions instance from the given embedding options.
+	 * <p>
+	 * 未提供请求超时时让 SDK 沿用客户端默认值；API key/base URL 等连接配置不在这里生效。
 	 * @param options the embedding options
 	 * @return a RequestOptions instance
 	 */
@@ -272,6 +297,7 @@ public class OpenAiEmbeddingModel extends AbstractEmbeddingModel {
 
 	private EmbeddingResponse generateEmbeddingResponse(CreateEmbeddingResponse response) {
 
+		// 每条结果保留服务端 index；批次级 model/usage 单独保存在响应元数据中。
 		List<Embedding> data = generateEmbeddingList(response.data());
 		EmbeddingResponseMetadata metadata = new EmbeddingResponseMetadata();
 		metadata.setModel(response.model());
@@ -280,6 +306,7 @@ public class OpenAiEmbeddingModel extends AbstractEmbeddingModel {
 	}
 
 	private DefaultUsage getDefaultUsage(CreateEmbeddingResponse.Usage nativeUsage) {
+		// Embedding 没有文本生成用量，因此 completionTokens 为 0；输入/总量取服务端统计。
 		return new DefaultUsage(toIntTokenCount("promptTokens", nativeUsage.promptTokens()), 0,
 				toIntTokenCount("totalTokens", nativeUsage.totalTokens()), nativeUsage);
 	}
@@ -307,6 +334,8 @@ public class OpenAiEmbeddingModel extends AbstractEmbeddingModel {
 	}
 
 	private List<Embedding> generateEmbeddingList(List<com.openai.models.embeddings.Embedding> nativeData) {
+		// SDK 已把响应解析为 List<Float>，这里拆箱成框架的 float[]，数组长度就是实际返回维度。
+		// 保持服务端结果顺序，不在此按 index 重排；index 用精确转换，超出 int 范围时失败。
 		List<Embedding> data = new ArrayList<>();
 		for (com.openai.models.embeddings.Embedding nativeDatum : nativeData) {
 			List<Float> nativeDatumEmbedding = nativeDatum.embedding();
@@ -335,6 +364,9 @@ public class OpenAiEmbeddingModel extends AbstractEmbeddingModel {
 		this.observationConvention = observationConvention;
 	}
 
+	/**
+	 * 装配默认选项、文档格式化策略和可复用客户端；build 只创建适配器，推理在 call/embed 时发生。
+	 */
 	public static final class Builder {
 
 		private @Nullable OpenAIClient openAiClient;

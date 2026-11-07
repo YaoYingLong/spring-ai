@@ -48,6 +48,14 @@ import org.springframework.util.Assert;
  * DefaultChatClientBuilder is a builder class for creating a ChatClient.
  * <p>
  * It provides methods to set default values for various properties of the ChatClient.
+ * <p>
+ * 中文导读：Builder 将 defaultSystem、defaultOptions、defaultAdvisors 等设置写入
+ * 同一个默认请求模板。build() 将该模板交给 DefaultChatClient，客户端每次 prompt()
+ * 再复制出独立的请求 Spec，因此默认配置不等于某一次模型请求。
+ * Builder 本身可变，应在组装阶段完成配置；不要把它当成并发请求共享的请求对象。
+ * <p>
+ * 模型连接及供应商默认选项来自传入的 ChatModel；这里额外负责客户端层的模板、
+ * Advisor 和 Observation。阅读实际请求如何合并配置时，继续看 DefaultChatClientUtils。
  *
  * @author Mark Pollack
  * @author Christian Tzolov
@@ -102,6 +110,8 @@ public class DefaultChatClientBuilder implements Builder {
 		Assert.notNull(chatModel, "the " + ChatModel.class.getName() + " must be non-null");
 		Assert.notNull(observationRegistry, "the " + ObservationRegistry.class.getName() + " must be non-null");
 
+		// 手工创建客户端也能获得工具执行能力，并让默认工具管理器复用同一个观测注册表。
+		// 显式传入的工具 Advisor Builder 由调用方负责配置，下面不会重写其中的管理器。
 		toolCallingAdvisorBuilder = Objects.requireNonNullElse(toolCallingAdvisorBuilder, ToolCallingAdvisor.builder()
 			.toolCallingManager(ToolCallingManager.builder().observationRegistry(observationRegistry).build()));
 
@@ -112,6 +122,7 @@ public class DefaultChatClientBuilder implements Builder {
 	}
 
 	public ChatClient build() {
+		// 此处只创建客户端；默认请求的复制发生在之后的 prompt() 调用中。
 		return new DefaultChatClient(this.defaultRequest);
 	}
 

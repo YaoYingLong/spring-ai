@@ -57,6 +57,14 @@ import org.springframework.util.StringUtils;
  * re-invokes the model, repeating up to {@code maxRepeatAttempts} times.
  * <p>
  * Streaming responses are not supported.
+ * <p>
+ * 中文导读：把“输出必须符合某个 JSON Schema”变成有界的反馈循环。
+ * 每轮复制自己的下游链，请求模型、校验第一条输出，再把错误追加到原始用户问题后重试。
+ * Schema 校验与 BeanOutputConverter 的 Java 反序列化是两个不同步骤。
+ * <p>
+ * maxRepeatAttempts 表示额外重试次数，总尝试次数最多是它加一。
+ * 当前循环耗尽后返回最后一次响应，而不是统一抛出“校验失败”异常；调用方仍需理解
+ * 后续转换和业务校验的错误契约。流式路径会直接返回不支持异常。
  *
  * @author Christian Tzolov
  * @author Jewoo Shin
@@ -130,6 +138,7 @@ public final class StructuredOutputValidationAdvisor implements CallAdvisor, Str
 
 		for (var currentAttemptNumber = 1 + this.maxRepeatAttempts; currentAttemptNumber > 0
 				&& !isValidationSuccess; currentAttemptNumber--) {
+			// 下游链执行时会消费队列；每次从原始拓扑复制，避免第二轮遇到已耗尽的链。
 			// Next Call
 			chatClientResponse = callAdvisorChain.copy(this).nextCall(processedChatClientRequest);
 
@@ -160,6 +169,7 @@ public final class StructuredOutputValidationAdvisor implements CallAdvisor, Str
 					String validationErrorMessage = "Output JSON validation failed because of: "
 							+ validationResponse.errorMessage();
 
+					// 每次以原始 Prompt 加上本轮错误重建，避免把所有重试错误无限累积到上下文。
 					Prompt augmentedPrompt = chatClientRequest.prompt()
 						.augmentUserMessage(userMessage -> userMessage.mutate()
 							.text(userMessage.getText() + System.lineSeparator() + validationErrorMessage)
@@ -173,6 +183,7 @@ public final class StructuredOutputValidationAdvisor implements CallAdvisor, Str
 			}
 		}
 
+		// 最终保留最后一次内容，并汇总多轮请求的 token 用量，避免只统计成功轮次的成本。
 		return usageAccumulator.applyAccumulatedUsage(Objects.requireNonNull(chatClientResponse));
 	}
 

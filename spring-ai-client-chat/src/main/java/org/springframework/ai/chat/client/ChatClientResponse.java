@@ -26,6 +26,13 @@ import org.springframework.util.Assert;
 
 /**
  * Represents a response returned by a {@link ChatClient}.
+ * <p>
+ * 中文导读：这是 ChatClient 层最完整的结果。chatResponse 保存模型生成内容、token
+ * 用量等元数据；context 保存 Advisor 随请求传播并补充的数据，例如 RAG 检索来源。
+ * 调用 content() 只会取第一条生成结果的文本，无法保留这些来源和用量信息。
+ * <p>
+ * chatResponse 允许为空，例如某个 Advisor 返回仅含上下文的结果。
+ * copy()/mutate() 只复制上下文 Map 容器，保留原有模型响应及 Map 值的引用。
  *
  * @param chatResponse The response returned by the AI model
  * @param context The contextual data propagated through the execution chain

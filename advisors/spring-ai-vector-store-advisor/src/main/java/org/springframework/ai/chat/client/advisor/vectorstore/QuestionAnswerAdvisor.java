@@ -45,6 +45,16 @@ import org.springframework.util.StringUtils;
  * Context for the question is retrieved from a Vector Store and added to the prompt's
  * user text.
  *
+ * <p>
+ * 中文导读：通过一次向量检索与一次用户消息增强实现基础 RAG。
+ * BaseAdvisor 负责 before、下游模型调用、after 的公共流程，本类只提供检索、拼接和来源回传。
+ * 与模块化 RetrievalAugmentationAdvisor 相比，这里没有查询变换、扩展、文档合并或后处理插槽。
+ *
+ * <p>
+ * 阅读顺序为 before 中的 SearchRequest 构造、similaritySearch、PromptTemplate.render，最后看 after。
+ * 检索使用当前用户文本，默认模板还提示模型结合已有历史回答；本类不会自行读取会话存储。
+ * 相似文档只是生成依据，默认提示词要求资料不足时拒答，并不在代码层保证模型回答正确。
+ *
  * @author Christian Tzolov
  * @author Timo Salm
  * @author Ilayaperumal Gopinathan
@@ -108,9 +118,11 @@ public class QuestionAnswerAdvisor implements BaseAdvisor {
 	@Override
 	public ChatClientRequest before(ChatClientRequest chatClientRequest, AdvisorChain advisorChain) {
 		// 1. Search for similar documents in the vector store.
+		// 每轮复制模板请求，再以当前用户文本替换 query，保留已配置的 topK、阈值与默认过滤条件。
 		var searchRequestBuilder = SearchRequest.from(this.searchRequest)
 			.query(Objects.requireNonNullElse(chatClientRequest.prompt().getUserMessage().getText(), ""));
 
+		// 动态过滤条件优先于固定条件，是替换关系，不自动将两者做 AND 合并。
 		var filterExpr = doGetFilterExpression(chatClientRequest.context());
 		if (filterExpr != null) {
 			searchRequestBuilder.filterExpression(filterExpr);
@@ -118,22 +130,26 @@ public class QuestionAnswerAdvisor implements BaseAdvisor {
 
 		var searchRequestToUse = searchRequestBuilder.build();
 
+		// 使用公开存储入口，向量生成、相似度算法及 Observation 包装由具体存储链路负责。
 		List<Document> documents = this.vectorStore.similaritySearch(searchRequestToUse);
 
 		// 2. Create the context from the documents.
 		Map<String, Object> context = new HashMap<>(chatClientRequest.context());
 		context.put(RETRIEVED_DOCUMENTS, documents);
 
+		// 模型上下文只拼正文，不自动加入来源 id、metadata 或 score；完整 Document 另存于 advisor context。
 		String documentContext = documents.stream()
 			.map(Document::getText)
 			.collect(Collectors.joining(System.lineSeparator()));
 
 		// 3. Augment the user prompt with the document context.
+		// 结果为空时 documentContext 是空串，仍照常渲染并继续下游调用；不存在代码层的空检索短路。
 		UserMessage userMessage = chatClientRequest.prompt().getUserMessage();
 		String augmentedUserText = this.promptTemplate
 			.render(Map.of("query", userMessage.getText(), "question_answer_context", documentContext));
 
 		// 4. Update ChatClientRequest with augmented prompt.
+		// 只替换当前用户消息文本，Prompt 中的其他消息和模型选项继续保留。
 		return chatClientRequest.mutate()
 			.prompt(chatClientRequest.prompt().augmentUserMessage(augmentedUserText))
 			.context(context)
@@ -142,6 +158,8 @@ public class QuestionAnswerAdvisor implements BaseAdvisor {
 
 	@Override
 	public ChatClientResponse after(ChatClientResponse chatClientResponse, AdvisorChain advisorChain) {
+		// 将实际召回列表回传到 ChatResponse.metadata，便于调用方展示资料来源或排查召回质量。
+		// 这里不改模型回答正文；流式场景的 after 调用时机由 BaseAdvisor 的结束标记判断控制。
 		ChatResponse.Builder chatResponseBuilder = ChatResponse.builder();
 		if (chatClientResponse.chatResponse() != null) {
 			chatResponseBuilder.from(chatClientResponse.chatResponse());
@@ -156,6 +174,7 @@ public class QuestionAnswerAdvisor implements BaseAdvisor {
 	}
 
 	protected Filter.@Nullable Expression doGetFilterExpression(Map<String, @Nullable Object> context) {
+		// 未设置或空白时回退到固定请求的过滤条件；有值时按文本语法解析，不直接传递 Expression 对象。
 		Object ctxFilterExpr = context.get(FILTER_EXPRESSION);
 		if (ctxFilterExpr == null || !StringUtils.hasText(ctxFilterExpr.toString())) {
 			return this.searchRequest.getFilterExpression();
@@ -165,6 +184,7 @@ public class QuestionAnswerAdvisor implements BaseAdvisor {
 
 	@Override
 	public Scheduler getScheduler() {
+		// BaseAdvisor 的流式入口在此 scheduler 上执行 before；同步 adviseCall 仍在调用线程执行。
 		return this.scheduler;
 	}
 
@@ -198,6 +218,7 @@ public class QuestionAnswerAdvisor implements BaseAdvisor {
 		}
 
 		public Builder protectFromBlocking(boolean protectFromBlocking) {
+			// 影响流式链路的调度选择，不会把底层同步 VectorStore API 转换为异步 API。
 			this.scheduler = protectFromBlocking ? BaseAdvisor.DEFAULT_SCHEDULER : Schedulers.immediate();
 			return this;
 		}

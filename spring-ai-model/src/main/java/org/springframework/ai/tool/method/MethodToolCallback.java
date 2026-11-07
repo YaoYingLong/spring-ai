@@ -44,6 +44,17 @@ import org.springframework.util.CollectionUtils;
 /**
  * A {@link ToolCallback} implementation to invoke methods as tools.
  *
+ * <p>
+ * 中文导读：本类把模型传回的 JSON 参数真正落到一次 Java 反射调用上。
+ * 注册时由 MethodToolCallbackProvider 提供工具定义、Method、目标对象和结果转换器；
+ * 调用时依次解析 JSON、按 Java 参数名取值、转换具体类型、invoke，再把返回值转换成字符串。
+ * 静态方法允许没有目标对象，实例方法必须绑定对象；本类不负责创建业务对象或管理其生命周期。
+ *
+ * <p>
+ * 面向模型的 Schema 已在注册阶段生成，本类执行时不会再次运行 JSON Schema 校验。
+ * 例如缺失参数首先表现为 null，之后能否传给 Java 参数由类型转换、反射和业务方法共同决定。
+ * ToolContext 则走独立注入分支，不从模型给出的 JSON 字段构造。
+ *
  * @author Thomas Vitale
  * @since 1.0.0
  */
@@ -106,6 +117,7 @@ public final class MethodToolCallback implements ToolCallback {
 
 		this.validateToolContextSupport(toolContext);
 
+		// JSON 对象的键来自模型按工具 Schema 生成的参数名；先解析为通用 Map，随后恢复各参数类型。
 		Map<String, Object> toolArguments = this.extractToolArguments(toolInput);
 		Assert.state(toolArguments != null, "toolArguments must not be null");
 
@@ -119,10 +131,14 @@ public final class MethodToolCallback implements ToolCallback {
 
 		Type returnType = this.toolMethod.getGenericReturnType();
 
+		// 转换器接收泛型返回类型；默认转换器生成 JSON 字符串，void 则转换为约定的完成响应。
+		// 返回值随后成为 ToolResponseMessage 的数据，由工具循环决定回送模型还是直接返回调用方。
 		return this.toolCallResultConverter.convert(result, returnType);
 	}
 
 	private void validateToolContextSupport(@Nullable ToolContext toolContext) {
+		// 当前契约要求声明 ToolContext 的方法收到非空内容，单纯 new ToolContext(emptyMap) 仍不满足。
+		// Schema 生成器会排除此特殊参数，因此不能依靠模型补齐它，应用需通过 toolContext 提供。
 		var isNonEmptyToolContextProvided = toolContext != null && !CollectionUtils.isEmpty(toolContext.getContext());
 		var isToolContextAcceptedByMethod = Stream.of(this.toolMethod.getParameterTypes())
 			.anyMatch(type -> ClassUtils.isAssignable(ToolContext.class, type));
@@ -146,6 +162,8 @@ public final class MethodToolCallback implements ToolCallback {
 	// Based on the implementation in MethodToolCallback.
 	@SuppressWarnings("null")
 	private Object[] buildMethodArguments(Map<String, Object> toolInputArguments, @Nullable ToolContext toolContext) {
+		// 按方法声明顺序构造 Object[]，确保 JSON 字段顺序不会影响实际参数位置。
+		// parameter.getName() 与 Schema 生成时使用同一个反射参数名，编译时保留参数名尤为重要。
 		return Stream.of(this.toolMethod.getParameters()).map(parameter -> {
 			if (ClassUtils.isAssignable(ToolContext.class, parameter.getType())) {
 				return toolContext;
@@ -161,10 +179,12 @@ public final class MethodToolCallback implements ToolCallback {
 		}
 		try {
 			if (type instanceof Class<?>) {
+				// 普通类型直接转换；例如 JSON 数字、字符串或 Map 转成目标参数声明的 Java 类型。
 				return jsonHelper.convertToTypedObject(value, (Class<?>) type);
 			}
 
 			// For generic types, use the fromJson method that accepts Type
+			// 保留 List<Item>、Map<String, Item> 等完整 Type，避免只得到原始 List 或嵌套 Map。
 			String json = jsonHelper.toJson(value, true);
 			return jsonHelper.fromJson(json, type);
 		}
@@ -177,18 +197,22 @@ public final class MethodToolCallback implements ToolCallback {
 
 	@SuppressWarnings("NullAway") // ex.getCause() is guaranteed to be non-null
 	private @Nullable Object callMethod(Object[] methodArguments) {
+		// 对非 public 对象或方法放开反射访问；是否允许仍受 JVM 模块和访问规则约束。
 		if (isObjectNotPublic() || isMethodNotPublic()) {
 			this.toolMethod.setAccessible(true);
 		}
 
 		Object result;
 		try {
+			// invoke 在当前线程同步执行，没有线程池、事务边界、重试或取消逻辑。
 			result = this.toolMethod.invoke(this.toolObject, methodArguments);
 		}
 		catch (IllegalAccessException ex) {
 			throw new IllegalStateException("Could not access method: " + ex.getMessage(), ex);
 		}
 		catch (InvocationTargetException ex) {
+			// 解开反射包装，保留业务异常作为 cause；Manager 的异常处理策略再决定是否回送错误文本。
+			// IllegalAccessException 等框架调用失败则走不同分支，不能把所有异常理解成模型可见结果。
 			throw new ToolExecutionException(this.toolDefinition, ex.getCause());
 		}
 		return result;

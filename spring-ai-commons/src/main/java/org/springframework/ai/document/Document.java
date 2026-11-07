@@ -46,6 +46,22 @@ import org.springframework.util.StringUtils;
  * Documents are intended to carry data through Spring AI's ETL pipeline — from ingestion
  * through transformation to storage in a vector store.
  *
+ * <p>
+ * 中文导读：这是 ETL 与检索链路共同使用的数据载体，而不是模型生成的回答或向量数组。
+ * Reader 负责读取原始资料，Transformer 可把一个 Document 切成多个片段，
+ * VectorStore 再根据片段生成或接收 embedding；检索时仍以 Document 返回正文、来源元数据和分数。
+ * 阅读时可沿构造器的内容约束、getFormattedContent 的文本呈现、Builder 的对象创建依次向下看。
+ *
+ * <p>
+ * id 标识存储中的记录，metadata 承载来源、页码、业务标签等结构化信息。
+ * 元数据是否进入 embedding 或模型上下文由调用方选择的 ContentFormatter、MetadataMode 决定；
+ * 仅把字段放入 metadata，并不表示检索和生成链路都会把它发送给模型。
+ *
+ * <p>
+ * score 的含义由检索器或后处理器赋予，例如某次查询的向量相似度。
+ * 分数高只说明在该度量下更相关，既不证明文档内容真实，也不代表生成答案正确的概率。
+ * 此类不校验分数区间，也不执行向量化、过滤或排序。
+ *
  * <h2>JSON serialization and deserialization</h2>
  * <p>
  * {@code Document} is fully Jackson-serializable. The serialized JSON uses the following
@@ -217,15 +233,20 @@ public class Document {
 
 	private Document(String id, @Nullable String text, @Nullable Media media, Map<String, Object> metadata,
 			@Nullable Double score) {
+		// 所有构造入口最终收敛到这里：id 必须有内容，metadata 不能包含 null 键或值。
+		// metadata 的扁平结构和简单值类型是上方说明的使用约定，这里没有逐项检查类型或嵌套层次。
 		Assert.hasText(id, "id cannot be null or empty");
 		Assert.notNull(metadata, "metadata cannot be null");
 		Assert.noNullElements(metadata.keySet(), "metadata cannot have null keys");
 		Assert.noNullElements(metadata.values(), "metadata cannot have null values");
+		// 异或要求 text、media 恰好一个非 null；空字符串仍属于合法文本，不代表合法的非空查询。
 		Assert.isTrue(text != null ^ media != null, "exactly one of text or media must be specified");
 
 		this.id = id;
 		this.text = text;
 		this.media = media;
+		// 只复制 Map 容器，值对象仍共享；getMetadata() 还会直接返回这个可变 Map。
+		// 因而字段为 final 不等于整个 Document 深度不可变。
 		this.metadata = new HashMap<>(metadata);
 		this.score = score;
 	}
@@ -299,6 +320,8 @@ public class Document {
 	 */
 	public String getFormattedContent(MetadataMode metadataMode) {
 		Assert.notNull(metadataMode, "Metadata mode must not be null");
+		// 这是按用途生成的一份文本表示，不会覆盖原始 text 或 metadata。
+		// 默认 formatter 根据 ALL/NONE/EMBED/INFERENCE 选择元数据，再按模板拼接正文。
 		return this.contentFormatter.format(this, metadataMode);
 	}
 
@@ -319,6 +342,7 @@ public class Document {
 	 * @return the metadata map
 	 */
 	public Map<String, Object> getMetadata() {
+		// 返回内部 Map，调用方可继续补充来源等信息；构造时的非 null 约束不会在后续 put 时重验。
 		return this.metadata;
 	}
 
@@ -357,6 +381,9 @@ public class Document {
 	 * @return a builder initialised from this document's state
 	 */
 	public Builder mutate() {
+		// 复制字段配置，但不复制临时 contentFormatter；build 后会恢复默认 formatter。
+		// metadata(Map) 暂时保留同一 Map 引用，直到 build 的构造器才复制容器。
+		// 因此在这个 Builder 上调用 metadata(key, value) 会先改到原 Document 的 Map。
 		return new Builder().id(this.id).text(this.text).media(this.media).metadata(this.metadata).score(this.score);
 	}
 
@@ -475,6 +502,7 @@ public class Document {
 		 */
 		public Builder metadata(Map<String, Object> metadata) {
 			Assert.notNull(metadata, "metadata cannot be null");
+			// Builder 仅保存引用；内容约束和 Map 容器复制统一留到 Document 构造时执行。
 			this.metadata = metadata;
 			return this;
 		}
@@ -524,6 +552,8 @@ public class Document {
 		 * or if the metadata contains null keys or values
 		 */
 		public Document build() {
+			// 没有显式 id 时才生成；默认 RandomIdGenerator 不以正文去重。
+			// 生成后的 id 回写到 Builder，复用同一 Builder 再 build 会沿用它。
 			if (!StringUtils.hasText(this.id)) {
 				var text = this.text != null ? this.text : "";
 				this.id = this.idGenerator.generateId(text, this.metadata);

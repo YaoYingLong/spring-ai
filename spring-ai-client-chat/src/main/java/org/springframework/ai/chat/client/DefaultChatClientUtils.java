@@ -35,6 +35,11 @@ import org.springframework.util.StringUtils;
 
 /**
  * Utilities for supporting the {@link DefaultChatClient} implementation.
+ * <p>
+ * 中文导读：这是 fluent API 与模型领域对象之间的转换边界。
+ * 输入是尚未渲染的请求 Spec，输出包含两部分：发给模型的 Prompt，以及供 Advisor
+ * 在本地传递状态的 context。只有显式被 Advisor 写进 Prompt 的上下文才会进入模型请求。
+ * 本方法由 call()/stream() 创建响应 Spec 时调用，尚不执行模型网络请求。
  *
  * @author Thomas Vitale
  * @author Sun Yuhan
@@ -56,9 +61,12 @@ final class DefaultChatClientUtils {
 
 		List<Message> processedMessages = new ArrayList<>();
 
+		// 消息顺序有语义：显式 system 文本在前，messages(...) 中的历史消息居中，当前 user 在后。
+		// messages(...) 已是 Message 对象，原样加入，不会再次经过这里的模板渲染。
 		// System Text => First in the list
 		String processedSystemText = inputRequest.getSystemText();
 		if (StringUtils.hasText(processedSystemText)) {
+			// 只有提供变量时才调用渲染器；systemParams 与 userParams 分开，避免相互覆盖。
 			if (!CollectionUtils.isEmpty(inputRequest.getSystemParams())) {
 				processedSystemText = PromptTemplate.builder()
 					.template(processedSystemText)
@@ -100,6 +108,9 @@ final class DefaultChatClientUtils {
 		 * ==========* OPTIONS * ==========
 		 */
 
+		// 从具体模型的选项创建同类型 Builder，保留供应商特有字段和工具能力。
+		// combineWith 以请求定制器的非 null 值覆盖默认值；没有指定的值沿用模型默认值。
+		// 这是 ChatClient 路径的合并步骤，不能据此推断直接 ChatModel.call(prompt) 也会合并。
 		ChatOptions.Builder<?> builder = inputRequest.getChatModel().getOptions().mutate();
 		if (inputRequest.getOptionsCustomizer() != null) {
 			builder = builder.combineWith(inputRequest.getOptionsCustomizer());
@@ -107,6 +118,7 @@ final class DefaultChatClientUtils {
 
 		if (builder instanceof ToolCallingChatOptions.Builder<?> tbuilder) {
 
+			// 已注册的回调直接使用；Provider 到构建本次请求时才展开，可反映动态工具集合。
 			List<ToolCallback> toolCallbacks = new ArrayList<>(inputRequest.getToolCallbacks());
 			for (var provider : inputRequest.getToolCallbackProviders()) {
 				toolCallbacks.addAll(java.util.List.of(provider.getToolCallbacks()));
@@ -118,6 +130,7 @@ final class DefaultChatClientUtils {
 			}
 
 			if (!inputRequest.getToolContext().isEmpty()) {
+				// ToolContext 是交给本地工具执行的上下文，不是模型生成的工具 JSON 参数。
 				tbuilder.toolContext(inputRequest.getToolContext());
 			}
 
@@ -129,6 +142,8 @@ final class DefaultChatClientUtils {
 		 * ==========* REQUEST * ==========
 		 */
 
+		// advisorParams 进入请求 context，例如 conversationId、RAG 过滤条件、结构化输出开关。
+		// 它与 userParams 的职责不同：后者已经在上面渲染为提示文本。
 		Builder promptBuilder = Prompt.builder().messages(processedMessages).chatOptions(processedChatOptions);
 		return ChatClientRequest.builder()
 			.prompt(promptBuilder.build())
